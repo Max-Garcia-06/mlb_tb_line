@@ -1,0 +1,302 @@
+"""
+edge_detector.py (MLB TB)
+------------------------
+Detect +EV edges on Kalshi total bases markets and size trades.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+from config import (
+    EDGE_THRESHOLD,
+    KELLY_FRACTION,
+    MAX_BET_PCT,
+    MIN_P,
+    MIN_LIMIT_PRICE,
+    MAX_YES_LINE,
+    TAIL_P_CUTOFF,
+    TAIL_EDGE_MULT,
+)
+from probability_engine import ProbabilityResult
+from kalshi_bridge import MarketLine, OrderResult, get_client
+from execution_engine import ExecutionLedger, LedgerKey, suggest_limit_price
+from trade_journal import TradeRow, append_row
+from calibration import load as load_calibrator
+
+log = logging.getLogger(__name__)
+
+MAX_BID_ASK_SPREAD = 0.25
+_CALIBRATOR = None
+
+
+def _calibrate(p: float) -> float:
+    global _CALIBRATOR
+    if _CALIBRATOR is None:
+        try:
+            _CALIBRATOR = load_calibrator()
+        except Exception:
+            _CALIBRATOR = False  # sentinel: don't try again
+    if not _CALIBRATOR:
+        return float(p)
+    try:
+        return float(_CALIBRATOR.transform(float(p)))
+    except Exception:
+        return float(p)
+
+
+@dataclass
+class EdgeSignal:
+    player_name: str
+    player_id: int
+    game_date: str
+    ticker: str
+    kalshi_line: float
+    predicted_lambda: float
+    p_model: float
+    p_market: float
+    edge: float
+    ev: float
+    kelly_f: float
+    recommended_contracts: int
+    recommended_side: str
+    bet_dollars: float
+    limit_price: float
+    book_bid: float
+    book_ask: float
+    book_spread: float
+
+
+def fractional_kelly(p: float, b: float, fraction: float = KELLY_FRACTION) -> float:
+    q = 1.0 - p
+    if b <= 0:
+        return 0.0
+    f_full = (b * p - q) / b
+    return round(max(0.0, f_full * fraction), 4)
+
+
+def dollars_to_contracts(dollars: float, contract_price: float) -> int:
+    if contract_price <= 0:
+        return 0
+    return max(1, int(dollars / contract_price))
+
+
+def detect_edge(
+    prob_result: ProbabilityResult,
+    market_line: MarketLine,
+    bankroll: float,
+    edge_threshold: float = EDGE_THRESHOLD,
+    max_spread: float = MAX_BID_ASK_SPREAD,
+    min_p: float = MIN_P,
+    tail_p_cutoff: float = TAIL_P_CUTOFF,
+    tail_edge_mult: float = TAIL_EDGE_MULT,
+) -> Optional[EdgeSignal]:
+    # Calibrate probabilities if a calibrator exists (trained from reconciled fills).
+    p_over = _calibrate(prob_result.p_over)
+    p_under = _calibrate(prob_result.p_under)
+
+    yes_edge = p_over - market_line.yes_ask
+    no_edge = p_under - market_line.no_ask
+
+    def _thr(p: float) -> float:
+        return edge_threshold * (tail_edge_mult if p < tail_p_cutoff else 1.0)
+
+    best = None
+    if (
+        p_over >= min_p
+        and yes_edge > _thr(p_over)
+        and market_line.yes_spread <= max_spread
+        and market_line.yes_ask >= MIN_LIMIT_PRICE
+        and market_line.line <= MAX_YES_LINE
+    ):
+        best = ("yes", p_over, market_line.yes_ask, yes_edge)
+    if p_under >= min_p and no_edge > _thr(p_under) and market_line.no_spread <= max_spread and market_line.no_ask >= MIN_LIMIT_PRICE:
+        cand = ("no", p_under, market_line.no_ask, no_edge)
+        if best is None or cand[3] > best[3]:
+            best = cand
+    if best is None:
+        return None
+
+    side, p, c, edge = best
+    b = (1.0 - c) / c if c > 0 else 0.0
+    ev = b * p - (1.0 - p)
+    if ev <= 0 or ev > 2.0:
+        return None
+
+    kf = fractional_kelly(p, b)
+    bet_dollars = min(kf * bankroll, MAX_BET_PCT * bankroll)
+    contracts = dollars_to_contracts(bet_dollars, c)
+
+    if side == "yes":
+        bid, ask, fair = market_line.yes_bid, market_line.yes_ask, p_over
+        book_bid, book_ask, book_spread = float(market_line.yes_bid), float(market_line.yes_ask), float(market_line.yes_spread)
+    else:
+        bid, ask, fair = market_line.no_bid, market_line.no_ask, p_under
+        book_bid, book_ask, book_spread = float(market_line.no_bid), float(market_line.no_ask), float(market_line.no_spread)
+    limit_price = suggest_limit_price(side=side, bid=bid, ask=ask, model_fair=fair)
+
+    return EdgeSignal(
+        player_name=prob_result.player_name,
+        player_id=prob_result.player_id,
+        game_date=prob_result.game_date,
+        ticker=market_line.ticker,
+        kalshi_line=market_line.line,
+        predicted_lambda=prob_result.predicted_lambda,
+        p_model=p,
+        p_market=c,
+        edge=edge,
+        ev=ev,
+        kelly_f=kf,
+        recommended_contracts=contracts,
+        recommended_side=side,
+        bet_dollars=round(bet_dollars, 2),
+        limit_price=limit_price,
+        book_bid=book_bid,
+        book_ask=book_ask,
+        book_spread=book_spread,
+    )
+
+
+def scan_for_edges(
+    prob_results: list[ProbabilityResult],
+    market_lines: list[MarketLine],
+    bankroll: float,
+    edge_threshold: float = EDGE_THRESHOLD,
+    min_p: float = MIN_P,
+    tail_p_cutoff: float = TAIL_P_CUTOFF,
+    tail_edge_mult: float = TAIL_EDGE_MULT,
+) -> list[EdgeSignal]:
+    market_map = {(ml.player_name.lower(), ml.line): ml for ml in market_lines}
+    out: list[EdgeSignal] = []
+    for pr in prob_results:
+        ml = market_map.get((pr.player_name.lower(), pr.kalshi_line))
+        if not ml:
+            continue
+        sig = detect_edge(
+            pr,
+            ml,
+            bankroll,
+            edge_threshold=edge_threshold,
+            min_p=min_p,
+            tail_p_cutoff=tail_p_cutoff,
+            tail_edge_mult=tail_edge_mult,
+        )
+        if sig:
+            out.append(sig)
+    out.sort(key=lambda s: s.ev, reverse=True)
+    return out
+
+
+def execute_signals(
+    signals: list[EdgeSignal],
+    dry_run: bool = True,
+    todays_tickers: Optional[set[str]] = None,
+    cancel_stale: bool = True,
+    replace_if_price_diff: float = 0.02,
+) -> list[OrderResult]:
+    client = get_client(force_mock=dry_run)
+    ledger = ExecutionLedger()
+    results: list[OrderResult] = []
+
+    desired = {(s.ticker, s.recommended_side): s for s in signals}
+
+    if not dry_run and cancel_stale and hasattr(client, "get_orders") and hasattr(client, "cancel_order"):
+        try:
+            open_orders = client.get_orders(status="resting", limit=200)
+        except Exception as e:
+            log.warning(f"Could not fetch open orders ({e}); skipping cancel/replace.")
+            open_orders = []
+        todays_tickers = todays_tickers or set()
+        for o in open_orders:
+            if todays_tickers and o.ticker not in todays_tickers:
+                continue
+            if (o.ticker, o.side) not in desired:
+                client.cancel_order(o.order_id)
+
+    for sig in signals:
+        key = LedgerKey(game_date=sig.game_date, ticker=sig.ticker, side=sig.recommended_side)
+        if ledger.has(key) and dry_run:
+            continue
+
+        book_bid, book_ask, book_spread = float(sig.book_bid), float(sig.book_ask), float(sig.book_spread)
+        p_market = float(sig.p_market)
+
+        expected_pnl = float(sig.edge) * int(sig.recommended_contracts)
+
+        ledger.add_attempt(key, price=sig.limit_price, contracts=sig.recommended_contracts, dollars=sig.bet_dollars, note="pre-submit")
+        append_row(
+            sig.game_date,
+            TradeRow(
+                game_date=sig.game_date,
+                ticker=sig.ticker,
+                side=sig.recommended_side,
+                action="buy",
+                contracts=sig.recommended_contracts,
+                limit_price=sig.limit_price,
+                order_id="",
+                player_name=sig.player_name,
+                kalshi_line=sig.kalshi_line,
+                predicted_lambda=sig.predicted_lambda,
+                p_model=sig.p_model,
+                p_market=p_market,
+                edge=sig.edge,
+                ev=sig.ev,
+                expected_pnl=expected_pnl,
+                book_bid=book_bid,
+                book_ask=book_ask,
+                book_spread=book_spread,
+                note="pre-submit",
+                success=None,
+            ).to_dict(),
+        )
+
+        if not dry_run and hasattr(client, "get_orders") and hasattr(client, "cancel_order"):
+            try:
+                existing = [o for o in client.get_orders(status="resting", ticker=sig.ticker, limit=50) if o.side == sig.recommended_side]
+            except Exception:
+                existing = []
+            for o in existing:
+                if abs(o.price - sig.limit_price) >= replace_if_price_diff:
+                    client.cancel_order(o.order_id)
+
+        result = client.place_order(sig.ticker, sig.recommended_side, sig.recommended_contracts, sig.limit_price)
+        ledger.add_attempt(
+            key,
+            price=sig.limit_price,
+            contracts=sig.recommended_contracts,
+            dollars=sig.bet_dollars,
+            note="post-submit",
+            order_id=result.order_id,
+            success=result.success,
+        )
+        append_row(
+            sig.game_date,
+            TradeRow(
+                game_date=sig.game_date,
+                ticker=sig.ticker,
+                side=sig.recommended_side,
+                action="buy",
+                contracts=sig.recommended_contracts,
+                limit_price=sig.limit_price,
+                order_id=result.order_id,
+                player_name=sig.player_name,
+                kalshi_line=sig.kalshi_line,
+                predicted_lambda=sig.predicted_lambda,
+                p_model=sig.p_model,
+                p_market=p_market,
+                edge=sig.edge,
+                ev=sig.ev,
+                expected_pnl=expected_pnl,
+                book_bid=book_bid,
+                book_ask=book_ask,
+                book_spread=book_spread,
+                note="post-submit",
+                success=result.success,
+            ).to_dict(),
+        )
+        results.append(result)
+
+    return results
+

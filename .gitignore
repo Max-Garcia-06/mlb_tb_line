@@ -1,0 +1,29 @@
+# Secrets and local env
+.env
+*.pem
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local data (DB, journals, ledger — regenerate or keep private)
+data/*.db
+data/*.jsonl
+data/execution_ledger.json
+
+# Trained binaries (retrain with `python run_pipeline.py train`)
+models/*.pkl
