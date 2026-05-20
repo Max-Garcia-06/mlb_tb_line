@@ -49,6 +49,18 @@ class ExecutionLedger:
         k = {"game_date": key.game_date, "ticker": key.ticker, "side": key.side}
         return k in (e.get("key") for e in self._data.get("entries", []))
 
+    def has_successful_submit(self, key: LedgerKey) -> bool:
+        """True if we already logged a successful post-submit for this key (avoid duplicate live orders)."""
+        k = {"game_date": key.game_date, "ticker": key.ticker, "side": key.side}
+        for e in reversed(self._data.get("entries", [])):
+            if e.get("key") != k:
+                continue
+            if str(e.get("note", "")) != "post-submit":
+                continue
+            if e.get("success") is True:
+                return True
+        return False
+
     def add_attempt(
         self,
         key: LedgerKey,

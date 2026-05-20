@@ -39,6 +39,7 @@ class TradeRow:
     kalshi_line: float = 0.0
     predicted_lambda: float = 0.0
     p_model: float = 0.0
+    p_model_raw: float = 0.0
     p_market: float = 0.0
     edge: float = 0.0
     ev: float = 0.0

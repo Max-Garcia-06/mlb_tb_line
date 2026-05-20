@@ -1,0 +1,32 @@
+team_abbr,distance_added_index,elevation_ft,notes
+ARI,0.08,1086,Chase Field retractable/dry air baseline
+ATL,0.02,1051,Truist slight elevation
+BAL,-0.03,33,Camden neutral
+BOS,-0.04,21,Fenway short LF wall / unique geometry
+CHC,-0.02,600,Wrigley marine layer variance
+CWS,0.01,594,Guaranteed Rate
+CIN,0.05,489,Great American bandbox
+CLE,-0.02,653,Progressive
+COL,0.18,5200,Coors altitude dominant
+DET,-0.03,600,Comerica spacious
+HOU,0.04,45,Minute Maid short porch CF
+KC,-0.04,886,Kauffman large OF
+LAA,0.02,154,Angels Stadium
+LAD,-0.01,515,Dodger Stadium pitcher-friendly
+MIA,-0.06,10,LoanDepot marine layer
+MIL,0.01,597,American Family retractable
+MIN,-0.02,815,Target Field
+NYM,-0.03,10,Citi Field
+NYY,-0.02,55,Yankee Stadium short porch
+OAK,0.00,13,Coliseum (legacy row; update if team moves)
+PHI,0.01,19,Citizens Bank
+PIT,-0.04,724,PNC pitcher-friendly
+SD,-0.03,62,Petco marine layer
+SEA,-0.02,3,T-Mobile marine layer
+SF,-0.05,0,Oracle marine layer / deep alleys
+STL,0.00,465,Busch neutral
+TB,-0.02,41,Tropicana dome
+TEX,0.03,549,Globe Life hitter-friendly
+TOR,0.01,270,Rogers Centre retractable
+WSH,-0.02,35,Nats Park
+WSN,-0.02,35,alias for WSH

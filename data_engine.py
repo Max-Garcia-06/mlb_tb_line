@@ -9,7 +9,9 @@ Stores one row per player-game into SQLite at config.DB_PATH.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
+from functools import lru_cache
 
 import pandas as pd
 import sqlalchemy as sa
@@ -17,12 +19,66 @@ import sqlalchemy as sa
 import statsapi
 
 from config import DB_PATH, SEASONS
+from venue_physics import lookup_park_physics
 
 log = logging.getLogger(__name__)
 
 
 def _engine():
     return sa.create_engine(f"sqlite:///{DB_PATH}")
+
+
+def fetch_game_environment(game_id: int) -> dict:
+    """
+    Venue + weather snapshot for a gamePk (best-effort; defaults if API fails).
+
+    park_team_abbr is the home team's abbreviation (park context for all PAs).
+    """
+    default = {
+        "park_team_abbr": "",
+        "venue_id": None,
+        "temp_f": None,
+        "wind_mph": None,
+        "wind_l_to_r": 0,
+    }
+    try:
+        d = statsapi.get("game", {"gamePk": int(game_id)})
+    except Exception:
+        return default
+    gd = (d or {}).get("gameData") or {}
+    teams = gd.get("teams") or {}
+    home = teams.get("home") or {}
+    weather = gd.get("weather") or {}
+    venue = gd.get("venue") or {}
+    abbr = str(home.get("abbreviation") or "").strip().upper()
+    temp_raw = weather.get("temp")
+    temp_f = None
+    if temp_raw is not None:
+        try:
+            temp_f = float(str(temp_raw).replace("°", "").strip())
+        except ValueError:
+            temp_f = None
+    wind_s = str(weather.get("wind") or "")
+    wind_mph = None
+    m = re.search(r"(\d+)\s*mph", wind_s, re.I)
+    if m:
+        try:
+            wind_mph = float(m.group(1))
+        except ValueError:
+            wind_mph = None
+    l_to_r = 1 if re.search(r"\b[LR]\s+To\s+R\b", wind_s, re.I) else 0
+    vid = venue.get("id")
+    try:
+        venue_id = int(vid) if vid is not None else None
+    except (TypeError, ValueError):
+        venue_id = None
+    return {
+        "park_team_abbr": abbr,
+        "venue_id": venue_id,
+        "temp_f": temp_f,
+        "wind_mph": wind_mph,
+        "wind_l_to_r": int(l_to_r),
+    }
 
 
 def _compute_tb(row: dict) -> int:
@@ -33,6 +89,103 @@ def _compute_tb(row: dict) -> int:
     hr = int(row.get("homeRuns", 0) or 0)
     singles = max(0, h - d2 - d3 - hr)
     return int(singles + 2 * d2 + 3 * d3 + 4 * hr)
+
+
+# MLB schedule statuses where the game has started or finished (exclude from live scan).
+_STARTED_GAME_STATUSES = frozenset(
+    {
+        "In Progress",
+        "Final",
+        "Game Over",
+        "Completed Early",
+    }
+)
+
+
+@lru_cache(maxsize=1)
+def _mlb_team_abbreviations() -> frozenset[str]:
+    teams = statsapi.get("teams", {"sportId": 1}).get("teams", []) or []
+    return frozenset(str(t.get("abbreviation", "")).strip().upper() for t in teams if t.get("abbreviation"))
+
+
+def parse_kalshi_event_matchup(event_ticker: str) -> tuple[str, str] | None:
+    """
+    Parse away/home team abbreviations from a Kalshi event ticker, e.g.
+    ``KXMLBTB-26MAY201940BOSKC`` -> (``BOS``, ``KC``).
+    """
+    et = (event_ticker or "").strip()
+    m = re.search(r"KXMLBTB-\d{2}[A-Z]{3}\d{2}\d{4}([A-Z]+)$", et)
+    if not m:
+        return None
+    blob = m.group(1)
+    abbrs = _mlb_team_abbreviations()
+    for i in range(2, len(blob)):
+        away = blob[:i]
+        home = blob[i:]
+        if away in abbrs and home in abbrs:
+            return away, home
+    return None
+
+
+def matchup_slug(away_abbr: str, home_abbr: str) -> str:
+    return f"{away_abbr}{home_abbr}"
+
+
+def game_status_allows_scan(status: str) -> bool:
+    return (status or "").strip() not in _STARTED_GAME_STATUSES
+
+
+def matchup_status_map(game_date: str) -> dict[str, str]:
+    """Map ``TEXCOL``-style keys to MLB schedule status for ``game_date`` (YYYY-MM-DD)."""
+    teams = statsapi.get("teams", {"sportId": 1}).get("teams", []) or []
+    abbr_by_id = {int(t["id"]): str(t["abbreviation"]).strip().upper() for t in teams if t.get("id")}
+    out: dict[str, str] = {}
+    for g in statsapi.schedule(date=game_date) or []:
+        away_id = g.get("away_id")
+        home_id = g.get("home_id")
+        if away_id is None or home_id is None:
+            continue
+        away = abbr_by_id.get(int(away_id), "")
+        home = abbr_by_id.get(int(home_id), "")
+        if not away or not home:
+            continue
+        out[matchup_slug(away, home)] = str(g.get("status", "") or "").strip()
+    return out
+
+
+def filter_market_lines_pregame(
+    market_lines: list,
+    game_date: str,
+) -> tuple[list, list[tuple[str, str, str]]]:
+    """
+    Drop markets tied to MLB games that have already started or finished.
+
+    Returns ``(kept_lines, excluded)`` where each excluded entry is
+    ``(event_ticker, matchup_slug, status)``.
+    """
+    status_by_matchup = matchup_status_map(game_date)
+    kept: list = []
+    excluded: list[tuple[str, str, str]] = []
+    seen_events: set[str] = set()
+    for ml in market_lines:
+        et = str(getattr(ml, "event_ticker", "") or "").strip()
+        if not et and getattr(ml, "ticker", ""):
+            parts = str(ml.ticker).split("-")
+            if len(parts) >= 2:
+                et = f"{parts[0]}-{parts[1]}"
+        matchup = parse_kalshi_event_matchup(et) if et else None
+        if not matchup:
+            kept.append(ml)
+            continue
+        key = matchup_slug(*matchup)
+        status = status_by_matchup.get(key, "")
+        if not status or game_status_allows_scan(status):
+            kept.append(ml)
+            continue
+        if et not in seen_events:
+            seen_events.add(et)
+            excluded.append((et, key, status))
+    return kept, excluded
 
 
 def fetch_games_for_season(season: int) -> list[dict]:
@@ -57,6 +210,8 @@ def fetch_batter_rows_for_game(game_id: int, game_date: str) -> list[dict]:
     """
     Pull boxscore data and return batter stat rows for the game.
     """
+    env = fetch_game_environment(game_id)
+    dai, elev = lookup_park_physics(env.get("park_team_abbr"))
     box = statsapi.boxscore_data(game_id)
     # NOTE: statsapi.boxscore_data returns top-level keys like "away"/"home",
     # each containing a "players" dict keyed by "ID{player_id}".
@@ -89,6 +244,13 @@ def fetch_batter_rows_for_game(game_id: int, game_date: str) -> list[dict]:
                 "so": int(stats.get("strikeOuts", 0) or 0),
                 "rbi": int(stats.get("rbi", 0) or 0),
                 "sb": int(stats.get("stolenBases", 0) or 0),
+                "park_team_abbr": env.get("park_team_abbr") or "",
+                "venue_id": env.get("venue_id"),
+                "temp_f": env.get("temp_f"),
+                "wind_mph": env.get("wind_mph"),
+                "wind_l_to_r": int(env.get("wind_l_to_r") or 0),
+                "venue_distance_added_index": float(dai),
+                "venue_elevation_ft": float(elev),
             }
             row["tb"] = _compute_tb(
                 {"hits": row["h"], "doubles": row["2b"], "triples": row["3b"], "homeRuns": row["hr"]}

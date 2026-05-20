@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from sklearn.isotonic import IsotonicRegression
 
-from config import MODEL_DIR
+from config import MAX_CALIB_P_DELTA, MODEL_DIR
 
 
 CALIB_PATH = Path(MODEL_DIR) / "p_calibrator_isotonic.pkl"
@@ -20,7 +20,13 @@ class ProbabilityCalibrator:
     def transform(self, p: float) -> float:
         p = float(p)
         p = min(1.0 - 1e-6, max(1e-6, p))
-        out = float(self.iso.predict([p])[0])
+        raw_iso = float(self.iso.predict([p])[0])
+        # Isotonic can clip to extreme bucket frequencies; cap movement from raw p.
+        delta = raw_iso - p
+        cap = float(MAX_CALIB_P_DELTA)
+        if cap > 0:
+            delta = max(-cap, min(cap, delta))
+        out = p + delta
         return min(1.0 - 1e-6, max(1e-6, out))
 
 

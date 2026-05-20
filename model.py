@@ -1,41 +1,54 @@
 """
 model.py (MLB TB)
 -----------------
-Train/load/predict a model for batter total bases (TB).
+Train/load/predict batter total bases (TB).
 
-Approach:
-- Predict expected TB (λ) via XGBoost regression on trailing features.
-- Convert λ -> probability via Poisson/NB in probability_engine.
+Default: proportional-odds ordinal logistic regression on engineered features,
+yielding a full TB PMF (better Under / tail pricing than mean + Poisson/NB).
+
+Legacy: set USE_LEGACY_XGB=1 to restore XGBoost Tweedie + count distribution head.
 """
 
 from __future__ import annotations
 
 import json
 import pickle
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBRegressor
 
-from config import MODEL_DIR, CV_GAP_DATES, EVAL_LINES
-from feature_store import build_feature_table, MODEL_FEATURES
+from config import CV_GAP_DATES, EVAL_LINES, MODEL_DIR, USE_LEGACY_XGB
+from feature_store import MODEL_FEATURES, build_feature_table
+from ordinal_core import (
+    NUM_TB_LEVELS,
+    expected_tb_from_pmf,
+    fit_ordinal_logit,
+    predict_pmf,
+    prob_over_line_from_pmf,
+)
 from probability_engine import prob_exceed
 
 
-MODEL_PATH = Path(MODEL_DIR) / "tb_xgb.pkl"
+def _use_xgb_head(meta: dict | None = None) -> bool:
+    if USE_LEGACY_XGB:
+        return True
+    if meta and meta.get("model_kind") == "xgb_tweedie":
+        return True
+    return False
+
+
+MODEL_PATH = Path(MODEL_DIR) / "tb_model.pkl"
 META_PATH = Path(MODEL_DIR) / "model_meta.pkl"
 BEST_PARAMS_PATH = Path(MODEL_DIR) / "best_params.json"
+LEGACY_XGB_PATH = Path(MODEL_DIR) / "tb_xgb.pkl"
 
 
 def load_best_params(path: Path = BEST_PARAMS_PATH) -> dict:
-    """
-    Load tuned hyperparameters (if present).
-
-    This file is written by `tune_hyperparameters()` and is optional.
-    """
     try:
         if path.exists():
             return json.loads(path.read_text())
@@ -52,9 +65,7 @@ def prepare_data() -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
 
 
 def _make_model(random_state: int = 42, params_override: dict | None = None) -> XGBRegressor:
-    # Tweedie works well for non-negative, overdispersed counts like TB.
     base_params = dict(
-        # Use a large cap on trees; early stopping will pick the effective number.
         n_estimators=4000,
         learning_rate=0.04,
         max_depth=4,
@@ -64,7 +75,6 @@ def _make_model(random_state: int = 42, params_override: dict | None = None) -> 
         min_child_weight=2.0,
         objective="reg:tweedie",
         tweedie_variance_power=1.25,
-        # Set eval metric here for older/newer XGBoost sklearn APIs.
         eval_metric="mae",
         random_state=random_state,
         n_jobs=4,
@@ -77,33 +87,22 @@ def _make_model(random_state: int = 42, params_override: dict | None = None) -> 
     return XGBRegressor(**base_params)
 
 
-def train(save: bool = True) -> tuple[XGBRegressor, dict]:
-    X, y, df = prepare_data()
-
-    # Time-based train/validation split for early stopping.
+def _train_xgb_legacy(X: pd.DataFrame, y: np.ndarray, df: pd.DataFrame, save: bool) -> tuple[XGBRegressor, dict]:
     dates = pd.to_datetime(df["game_date"]).dt.normalize()
     uniq_dates = np.array(sorted(dates.unique()))
     if len(uniq_dates) < 4:
-        # Not enough history to do a meaningful split; fall back to fitting on all data.
         model = _make_model(random_state=42)
         model.fit(X, y)
     else:
-        # Use oldest ~80% of dates for training, newest ~20% for validation.
         cutoff_idx = max(1, int(len(uniq_dates) * 0.8))
         if cutoff_idx >= len(uniq_dates):
             cutoff_idx = len(uniq_dates) - 1
         train_dates = uniq_dates[:cutoff_idx]
         val_dates = uniq_dates[cutoff_idx:]
-
         train_mask = dates.isin(train_dates)
         val_mask = dates.isin(val_dates)
-
         X_train, y_train = X[train_mask], y[train_mask]
         X_val, y_val = X[val_mask], y[val_mask]
-
-        # Some XGBoost sklearn versions don't support early stopping kwargs in fit().
-        # Implement a simple "early stopping"-like selection by choosing n_estimators
-        # based on validation MAE over an increasing tree count grid.
         candidate_ns = [200, 400, 700, 1000, 1400, 1800, 2400, 3200, 4000]
         best = {"n": None, "mae": float("inf")}
         for n in candidate_ns:
@@ -114,8 +113,6 @@ def train(save: bool = True) -> tuple[XGBRegressor, dict]:
             mae = mean_absolute_error(y_val, pred_val)
             if mae < best["mae"]:
                 best = {"n": int(n), "mae": float(mae)}
-
-        # Retrain on the full dataset with the chosen tree count.
         model = _make_model(random_state=42)
         model.set_params(n_estimators=int(best["n"] or 900))
         model.fit(X, y, verbose=False)
@@ -123,44 +120,128 @@ def train(save: bool = True) -> tuple[XGBRegressor, dict]:
     preds = model.predict(X)
     resid = y - preds
     meta = {
+        "model_kind": "xgb_tweedie",
         "train_rows": int(len(X)),
         "residual_std": float(np.std(resid)),
         "residual_var": float(np.var(resid)),
         "feature_names": list(X.columns),
         "trained_on": str(df["game_date"].max()),
     }
-
     if save:
         MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(MODEL_PATH, "wb") as f:
-            pickle.dump(model, f)
+            pickle.dump({"kind": "xgb", "model": model}, f)
         with open(META_PATH, "wb") as f:
             pickle.dump(meta, f)
-
+        with open(LEGACY_XGB_PATH, "wb") as f:
+            pickle.dump(model, f)
     return model, meta
 
 
-def load_model() -> tuple[XGBRegressor, dict]:
-    if not MODEL_PATH.exists() or not META_PATH.exists():
+def _train_ordinal(X: pd.DataFrame, y: np.ndarray, df: pd.DataFrame, save: bool) -> tuple[object, dict]:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        res = fit_ordinal_logit(X, y, disp=False)
+    pmf_all = predict_pmf(res, X)
+    lam_hat = np.array([expected_tb_from_pmf(pmf_all[i]) for i in range(len(X))])
+    resid = y - lam_hat
+    meta = {
+        "model_kind": "ordinal_logit",
+        "train_rows": int(len(X)),
+        "residual_std": float(np.std(resid)),
+        "residual_var": float(np.var(resid)),
+        "feature_names": list(X.columns),
+        "trained_on": str(df["game_date"].max()),
+        "num_tb_levels": int(NUM_TB_LEVELS),
+    }
+    if save:
+        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(MODEL_PATH, "wb") as f:
+            pickle.dump({"kind": "ordinal", "result": res, "feature_names": list(X.columns)}, f)
+        with open(META_PATH, "wb") as f:
+            pickle.dump(meta, f)
+    return res, meta
+
+
+def train(save: bool = True) -> tuple[object, dict]:
+    X, y, df = prepare_data()
+    if _use_xgb_head(None):
+        return _train_xgb_legacy(X, y, df, save)
+    return _train_ordinal(X, y, df, save)
+
+
+def load_model() -> tuple[object, dict]:
+    if not META_PATH.exists():
         raise FileNotFoundError("Model not found. Run: python run_pipeline.py train")
-    with open(MODEL_PATH, "rb") as f:
-        model = pickle.load(f)
     with open(META_PATH, "rb") as f:
         meta = pickle.load(f)
-    return model, meta
+    blob_path = MODEL_PATH if MODEL_PATH.exists() else LEGACY_XGB_PATH
+    if not blob_path.exists():
+        raise FileNotFoundError("Model weights not found. Run: python run_pipeline.py train")
+    with open(blob_path, "rb") as f:
+        blob = pickle.load(f)
+    if isinstance(blob, dict) and blob.get("kind") == "ordinal":
+        meta.setdefault("model_kind", "ordinal_logit")
+        return blob["result"], meta
+    if isinstance(blob, dict) and blob.get("kind") == "xgb":
+        meta.setdefault("model_kind", "xgb_tweedie")
+        return blob["model"], meta
+    # Legacy pickle was raw XGBRegressor
+    meta.setdefault("model_kind", "xgb_tweedie")
+    return blob, meta
 
 
-def predict_lambda(row_features: dict | pd.DataFrame, model: XGBRegressor) -> float | np.ndarray:
+def predict_lambda(
+    row_features: dict | pd.DataFrame,
+    model: object,
+    feature_names: list[str] | None = None,
+    meta: dict | None = None,
+) -> float | np.ndarray:
+    fn = feature_names or list(MODEL_FEATURES)
+    if _use_xgb_head(meta):
+        if isinstance(row_features, dict):
+            X = pd.DataFrame([row_features])
+            return float(model.predict(X)[0])
+        X = row_features[fn] if isinstance(row_features, pd.DataFrame) else row_features
+        return model.predict(X)
+    from ordinal_core import OrdinalModelBundle
+
+    if isinstance(model, OrdinalModelBundle):
+        bundle = model
+    else:
+        bundle = OrdinalModelBundle(result=model, feature_names=fn)
     if isinstance(row_features, dict):
-        X = pd.DataFrame([row_features])
-        return float(model.predict(X)[0])
-    X = row_features[MODEL_FEATURES] if isinstance(row_features, pd.DataFrame) else row_features
-    return model.predict(X)
+        pmf = bundle.predict_pmf_row({k: row_features[k] for k in fn})
+        return float(expected_tb_from_pmf(pmf))
+    X = row_features[fn] if isinstance(row_features, pd.DataFrame) else row_features
+    pmfs = predict_pmf(bundle.result, X.astype(float))
+    return np.array([expected_tb_from_pmf(pmfs[i]) for i in range(len(pmfs))])
+
+
+def predict_tb_pmf_row(
+    row_features: dict,
+    model: object,
+    feature_names: list[str] | None = None,
+    meta: dict | None = None,
+) -> np.ndarray:
+    """Return length-NUM_TB_LEVELS PMF for one feature row (dict keys must include features)."""
+    fn = feature_names or list(MODEL_FEATURES)
+    if _use_xgb_head(meta):
+        lam = float(predict_lambda(row_features, model, feature_names=fn, meta=meta))
+        from scipy.stats import poisson
+
+        p = np.array([poisson.pmf(k, max(lam, 0.05)) for k in range(NUM_TB_LEVELS - 1)], dtype=float)
+        tail = 1.0 - p.sum()
+        out = np.zeros(NUM_TB_LEVELS, dtype=float)
+        out[: NUM_TB_LEVELS - 1] = p
+        out[-1] = max(tail, 0.0)
+        out /= out.sum()
+        return out
+    X = pd.DataFrame([{k: row_features[k] for k in fn}]).astype(float)
+    return predict_pmf(model, X)[0]
 
 
 def walk_forward_cv(X: pd.DataFrame, y: np.ndarray, n_splits: int = 5) -> dict:
-    # Backwards-compatible wrapper: run date-based CV if we can infer dates.
-    # This retains the old signature used by `run_pipeline.py`.
     df = build_feature_table().dropna(subset=["tb"] + MODEL_FEATURES).sort_values("game_date").reset_index(drop=True)
     X2 = df[MODEL_FEATURES].copy()
     y2 = df["tb"].astype(float).values
@@ -174,11 +255,6 @@ def walk_forward_cv_by_date(
     n_splits: int = 5,
     gap_dates: int = 1,
 ) -> dict:
-    """
-    Walk-forward CV split by unique game_date (with an embargo gap in date units).
-
-    This prevents subtle leakage where row-based splits can interleave the same day.
-    """
     dates = pd.to_datetime(df["game_date"]).dt.normalize()
     uniq = np.array(sorted(dates.unique()))
     if len(uniq) < (n_splits + 2):
@@ -188,33 +264,40 @@ def walk_forward_cv_by_date(
     maes: list[float] = []
     fold_rows: list[int] = []
     oof_pred = np.full(shape=(len(X),), fill_value=np.nan, dtype=float)
+    oof_pmf: list[np.ndarray | None] = [None] * len(X)
 
     for fold, (train_d_idx, test_d_idx) in enumerate(tscv.split(uniq), start=1):
         train_dates = uniq[train_d_idx]
         test_dates = uniq[test_d_idx]
 
         if gap_dates and gap_dates > 0:
-            cutoff = train_dates[-1]
-            embargo_start = cutoff
-            # Exclude the last `gap_dates` training dates and any dates between train and test.
+            embargo_start = train_dates[-1]
             if len(train_dates) > gap_dates:
                 train_dates = train_dates[: -gap_dates]
                 embargo_start = train_dates[-1]
-            # Ensure we don't accidentally overlap by date
             test_dates = test_dates[test_dates > embargo_start]
 
         train_mask = dates.isin(train_dates)
         test_mask = dates.isin(test_dates)
-
         train_idx = np.flatnonzero(train_mask.values)
         test_idx = np.flatnonzero(test_mask.values)
         if len(train_idx) == 0 or len(test_idx) == 0:
             continue
 
-        m = _make_model(random_state=42 + fold)
-        m.fit(X.iloc[train_idx], y[train_idx])
-        pred = m.predict(X.iloc[test_idx])
-        oof_pred[test_idx] = pred
+        if _use_xgb_head(None):
+            m = _make_model(random_state=42 + fold)
+            m.fit(X.iloc[train_idx], y[train_idx])
+            pred = m.predict(X.iloc[test_idx])
+            oof_pred[test_idx] = pred
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                res = fit_ordinal_logit(X.iloc[train_idx], y[train_idx], disp=False)
+            pmf_te = predict_pmf(res, X.iloc[test_idx])
+            pred = np.array([expected_tb_from_pmf(pmf_te[i]) for i in range(len(test_idx))])
+            oof_pred[test_idx] = pred
+            for j, ti in enumerate(test_idx):
+                oof_pmf[ti] = pmf_te[j]
 
         maes.append(mean_absolute_error(y[test_idx], pred))
         fold_rows.append(int(len(test_idx)))
@@ -223,22 +306,26 @@ def walk_forward_cv_by_date(
     if not np.any(valid):
         raise RuntimeError("CV produced no out-of-fold predictions. Check split settings.")
 
-    # Probability scoring for common TB lines (aligned to your 'over' markets).
-    # We use a fixed NB variance estimated from OOF residuals.
     resid = y[valid] - oof_pred[valid]
     variance = float(np.var(resid))
 
     prob_metrics: dict[str, float] = {}
     eps = 1e-6
     for line in EVAL_LINES:
-        p_over = np.array([prob_exceed(float(l), float(line), variance) for l in oof_pred[valid]], dtype=float)
+        if _use_xgb_head(None):
+            p_over = np.array([prob_exceed(float(l), float(line), variance) for l in oof_pred[valid]], dtype=float)
+        else:
+            p_over = np.zeros(int(np.sum(valid)), dtype=float)
+            vi = np.flatnonzero(valid)
+            for ii, idx in enumerate(vi):
+                pmf = oof_pmf[idx]
+                if pmf is None:
+                    continue
+                p_over[ii] = prob_over_line_from_pmf(pmf, float(line))
         p_over = np.clip(p_over, eps, 1 - eps)
         y_over = (y[valid] > float(line)).astype(float)
-
-        brier = float(np.mean((p_over - y_over) ** 2))
-        logloss = float(-np.mean(y_over * np.log(p_over) + (1.0 - y_over) * np.log(1.0 - p_over)))
-        prob_metrics[f"brier@{line:g}"] = brier
-        prob_metrics[f"logloss@{line:g}"] = logloss
+        prob_metrics[f"brier@{line:g}"] = float(np.mean((p_over - y_over) ** 2))
+        prob_metrics[f"logloss@{line:g}"] = float(-np.mean(y_over * np.log(p_over) + (1.0 - y_over) * np.log(1.0 - p_over)))
 
     return {
         "mean_mae": float(np.mean(maes)) if maes else float("nan"),
@@ -249,11 +336,21 @@ def walk_forward_cv_by_date(
     }
 
 
-def get_feature_importance(model: XGBRegressor) -> pd.DataFrame:
-    booster = model.get_booster()
-    score = booster.get_score(importance_type="gain")
-    df = pd.DataFrame({"feature": list(score.keys()), "importance": list(score.values())})
-    return df.sort_values("importance", ascending=False).reset_index(drop=True)
+def get_feature_importance(model: object, meta: dict | None = None) -> pd.DataFrame:
+    if _use_xgb_head(meta) or hasattr(model, "get_booster"):
+        booster = model.get_booster()
+        score = booster.get_score(importance_type="gain")
+        df = pd.DataFrame({"feature": list(score.keys()), "importance": list(score.values())})
+        return df.sort_values("importance", ascending=False).reset_index(drop=True)
+    try:
+        names = list(getattr(model.model, "exog_names", []) or MODEL_FEATURES)
+        params = np.asarray(model.params, dtype=float)
+        n_feat = min(len(names), len(params) - max(int(getattr(model.model, "k_levels", NUM_TB_LEVELS - 1)), 1))
+        imp = np.abs(params[:n_feat])
+        df = pd.DataFrame({"feature": names[:n_feat], "importance": imp})
+        return df.sort_values("importance", ascending=False).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame({"feature": [], "importance": []})
 
 
 def _score_cv_for_params(
@@ -265,9 +362,9 @@ def _score_cv_for_params(
     n_splits: int,
     gap_dates: int,
 ) -> dict:
-    """
-    Score a hyperparameter set using the same date-based CV logic and probability metrics.
-    """
+    if not _use_xgb_head(None):
+        return walk_forward_cv_by_date(df, X, y, n_splits=n_splits, gap_dates=int(gap_dates))
+
     dates = pd.to_datetime(df["game_date"]).dt.normalize()
     uniq = np.array(sorted(dates.unique()))
     if len(uniq) < (n_splits + 2):
@@ -337,18 +434,18 @@ def tune_hyperparameters(
     random_seed: int = 42,
     save_path: Path = BEST_PARAMS_PATH,
 ) -> tuple[dict, dict]:
-    """
-    Hyperparameter search optimized for probability quality (mean logloss across EVAL_LINES).
+    if not _use_xgb_head(None):
+        df = build_feature_table().dropna(subset=["tb"] + MODEL_FEATURES).sort_values("game_date").reset_index(drop=True)
+        X = df[MODEL_FEATURES].copy()
+        y = df["tb"].astype(float).values
+        score = walk_forward_cv_by_date(df, X, y, n_splits=int(n_splits), gap_dates=int(gap_dates))
+        return {}, score
 
-    Returns: (best_params, best_score_dict)
-    """
     rng = np.random.default_rng(int(random_seed))
     df = build_feature_table().dropna(subset=["tb"] + MODEL_FEATURES).sort_values("game_date").reset_index(drop=True)
     X = df[MODEL_FEATURES].copy()
     y = df["tb"].astype(float).values
 
-    # Search space: keep it modest so it finishes on a laptop.
-    # (We avoid early_stopping_rounds since your XGBoost sklearn wrapper doesn't support it.)
     n_estimators_choices = np.array([300, 500, 800, 1200, 1800, 2400, 3200, 4000], dtype=int)
     max_depth_choices = np.array([3, 4, 5, 6], dtype=int)
 
@@ -378,4 +475,3 @@ def tune_hyperparameters(
     save_path.parent.mkdir(parents=True, exist_ok=True)
     save_path.write_text(json.dumps(best_params, indent=2, sort_keys=True))
     return best_params, best_score
-

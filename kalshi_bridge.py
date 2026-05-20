@@ -12,17 +12,42 @@ import base64
 import logging
 import re
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from config import KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, KALSHI_BASE_URL, KALSHI_ORDER_URL
+from config import (
+    KALSHI_API_KEY_ID,
+    KALSHI_BASE_URL,
+    KALSHI_ORDER_URL,
+    KALSHI_PRIVATE_KEY_PATH,
+    REQUIRE_KALSHI_CREDENTIALS,
+)
+from flow_monitor import vpin_from_signed_volumes
 
 log = logging.getLogger(__name__)
+
+
+def read_price_from_market_dict(m: dict, dollars_key: str, cents_key: str) -> float:
+    """Read a Kalshi price field as dollars (supports *_dollars or cent integers)."""
+    if m.get(dollars_key) is not None:
+        try:
+            v = float(m[dollars_key])
+            return v if v > 0 else 0.0
+        except (TypeError, ValueError):
+            pass
+    if m.get(cents_key) is not None:
+        try:
+            return float(m[cents_key]) / 100.0
+        except (TypeError, ValueError):
+            pass
+    return 0.0
 
 
 @dataclass
@@ -38,6 +63,9 @@ class MarketLine:
     no_bid: float
     volume: int = 0
     open_interest: int = 0
+    xref_player_id: str = ""
+    vpin_toxicity: float = 0.0
+    event_ticker: str = ""
 
     @property
     def yes_mid(self) -> float:
@@ -170,6 +198,29 @@ class KalshiClient:
             return lines
         return [ml for ml in lines if ml.game_date == game_date]
 
+    @staticmethod
+    def _xref_from_market(m: dict) -> str:
+        for k in (
+            "xref_player_id",
+            "xref_id",
+            "cross_ref_player_id",
+            "mlb_player_id",
+            "player_xref_id",
+            "custom_strike",
+        ):
+            v = m.get(k)
+            if v is None:
+                continue
+            if isinstance(v, dict):
+                for sub in ("player_id", "id", "xref", "mlb_id"):
+                    if v.get(sub) is not None:
+                        return str(v.get(sub)).strip()
+                continue
+            s = str(v).strip()
+            if s:
+                return s
+        return ""
+
     def parse_total_bases_markets(self, raw_markets: list[dict]) -> list[MarketLine]:
         lines: list[MarketLine] = []
         for m in raw_markets:
@@ -180,14 +231,11 @@ class KalshiClient:
             try:
                 line = float(m["floor_strike"]) if m.get("floor_strike") is not None else self._extract_line_from_title(title)
                 player_name = self._extract_player_from_title(title)
+                xref = self._xref_from_market(m)
 
                 def _price(dollars_key, cents_key, fallback):
-                    if m.get(dollars_key) is not None:
-                        v = float(m[dollars_key])
-                        return v if v > 0 else fallback
-                    if m.get(cents_key) is not None:
-                        return float(m[cents_key]) / 100
-                    return fallback
+                    v = read_price_from_market_dict(m, dollars_key, cents_key)
+                    return v if v > 0 else fallback
 
                 yes_ask = _price("yes_ask_dollars", "yes_ask", 0.50)
                 yes_bid = _price("yes_bid_dollars", "yes_bid", 0.48)
@@ -205,6 +253,7 @@ class KalshiClient:
                         player_name=player_name,
                         player_id=0,
                         game_date=game_date_str,
+                        event_ticker=event_ticker,
                         line=line,
                         yes_ask=yes_ask,
                         yes_bid=yes_bid,
@@ -212,6 +261,8 @@ class KalshiClient:
                         no_bid=no_bid,
                         volume=int(m.get("volume", 0) or 0),
                         open_interest=int(m.get("open_interest", 0) or 0),
+                        xref_player_id=xref,
+                        vpin_toxicity=0.0,
                     )
                 )
             except Exception:
@@ -324,9 +375,67 @@ class KalshiClient:
         data = self._get(f"/markets/{ticker}")
         return data.get("market", data)
 
+    def get_trade_signed_sizes(self, ticker: str, limit: int = 200) -> list[float]:
+        """
+        Best-effort signed trade sizes (+ buy, - sell) for VPIN. Returns [] if endpoint unavailable.
+        """
+        try:
+            data = self._get("/markets/trades", params={"ticker": ticker, "limit": int(limit)})
+        except Exception:
+            return []
+        out: list[float] = []
+        for t in data.get("trades", []) or []:
+            try:
+                cnt = float(t.get("count") or t.get("quantity") or 0)
+            except (TypeError, ValueError):
+                cnt = 0.0
+            if cnt <= 0:
+                continue
+            side = str(t.get("taker_side") or t.get("side") or "").lower()
+            if side in {"yes", "buy"}:
+                out.append(cnt)
+            elif side in {"no", "sell"}:
+                out.append(-cnt)
+            else:
+                out.append(cnt)
+        return out
+
+    def vpin_proxy(self, ticker: str, bucket: float = 400.0) -> float:
+        seq = self.get_trade_signed_sizes(ticker, limit=300)
+        if len(seq) < 5:
+            return 0.0
+        return float(vpin_from_signed_volumes(seq, bucket_target=bucket))
+
     def get_balance(self) -> float:
         data = self._get("/portfolio/balance")
         return float(data.get("balance", {}).get("available_balance", 0)) / 100
+
+
+def attach_vpin_proxy_batch(
+    client: object,
+    market_lines: list[MarketLine],
+    *,
+    max_workers: int = 8,
+) -> None:
+    """Fill ``vpin_toxicity`` on each line using concurrent per-ticker fetches."""
+    if not market_lines or not hasattr(client, "vpin_proxy"):
+        return
+
+    def _one(ml: MarketLine) -> tuple[str, float]:
+        try:
+            return ml.ticker, float(getattr(client, "vpin_proxy")(ml.ticker))
+        except Exception:
+            return ml.ticker, 0.0
+
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+        futures = {ex.submit(_one, ml): ml for ml in market_lines}
+        for fut in as_completed(futures):
+            ml = futures[fut]
+            try:
+                _, tox = fut.result()
+                ml.vpin_toxicity = float(tox)
+            except Exception:
+                ml.vpin_toxicity = 0.0
 
 
 class MockKalshiClient:
@@ -354,6 +463,8 @@ class MockKalshiClient:
                     no_bid=round(1 - p["yes_ask"], 4),
                     volume=500,
                     open_interest=1000,
+                    xref_player_id="",
+                    vpin_toxicity=0.0,
                 )
             )
         if not game_date:
@@ -379,9 +490,44 @@ class MockKalshiClient:
     def get_balance(self) -> float:
         return 1000.0
 
+    def get_trade_signed_sizes(self, ticker: str, limit: int = 200) -> list[float]:
+        return []
+
+    def vpin_proxy(self, ticker: str, bucket: float = 400.0) -> float:
+        return 0.0
+
 
 def get_client(force_mock: bool = False) -> KalshiClient | MockKalshiClient:
-    if force_mock or not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY_PATH:
+    if force_mock:
         return MockKalshiClient()
-    return KalshiClient()
+    key_id = str(KALSHI_API_KEY_ID).strip()
+    key_path = str(KALSHI_PRIVATE_KEY_PATH).strip()
+    if not key_id or not key_path:
+        if REQUIRE_KALSHI_CREDENTIALS:
+            raise RuntimeError(
+                "Kalshi credentials missing: set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH in .env "
+                "(or unset REQUIRE_KALSHI_CREDENTIALS to allow the mock client)."
+            )
+        return MockKalshiClient()
+
+    pem = Path(key_path).expanduser()
+    if not pem.is_file():
+        msg = f"Kalshi private key file not found: {pem}"
+        if REQUIRE_KALSHI_CREDENTIALS:
+            raise FileNotFoundError(msg)
+        log.warning("%s — using mock Kalshi client.", msg)
+        return MockKalshiClient()
+
+    try:
+        return KalshiClient()
+    except OSError as e:
+        if REQUIRE_KALSHI_CREDENTIALS:
+            raise
+        log.warning("Kalshi client init failed (%s); using mock.", e)
+        return MockKalshiClient()
+    except Exception as e:
+        if REQUIRE_KALSHI_CREDENTIALS:
+            raise
+        log.warning("Kalshi client init failed (%s); using mock.", e, exc_info=True)
+        return MockKalshiClient()
 
