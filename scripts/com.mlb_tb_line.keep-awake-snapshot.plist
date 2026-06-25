@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mlb_tb_line.keep-awake-snapshot</string>
+  <key>Comment</key>
+  <string>Prevent idle sleep 9:50–10:35 ET so 10:00 snapshot cron can run</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>-t</string>
+    <string>2700</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>50</integer>
+    <key>TimeZone</key>
+    <string>America/New_York</string>
+  </dict>
+  <key>StandardErrorPath</key>
+  <string>@@REPO@@/logs/keep-awake-snapshot.err</string>
+  <key>StandardOutPath</key>
+  <string>@@REPO@@/logs/keep-awake-snapshot.out</string>
+</dict>
+</plist>

@@ -13,6 +13,18 @@ def market_yes_no_result(market: dict) -> str:
     return str((market or {}).get("result") or "").lower()
 
 
+def line_bucket(line: float) -> str:
+    """Kalshi TB strike bucket for segment reporting."""
+    ln = float(line)
+    if ln <= 0.5:
+        return "0.5"
+    if ln <= 1.5:
+        return "1.5"
+    if ln <= 2.5:
+        return "2.5"
+    return "3.5+"
+
+
 def price_bucket(price: float) -> str:
     if price < 0.20:
         return "<0.20"

@@ -17,6 +17,7 @@ from config import (
     KELLY_FRACTION,
     MAX_BET_PCT,
     MAX_REALISTIC_ASK,
+    MIN_EV,
     MIN_P,
     MIN_LIMIT_PRICE,
     MIN_REALISTIC_ASK,
@@ -24,31 +25,82 @@ from config import (
     TAIL_P_CUTOFF,
     TAIL_EDGE_MULT,
     USE_ISOTONIC_CALIBRATION,
+    USE_OOF_CALIBRATION,
+    USE_SEGMENTED_CALIBRATION,
     VPIN_MAX_TOXIC,
 )
 from probability_engine import ProbabilityResult
 from kalshi_bridge import MarketLine, OrderResult, get_client
 from execution_engine import ExecutionLedger, LedgerKey, suggest_limit_price
 from trade_journal import TradeRow, append_row
-from calibration import load as load_calibrator
+from calibration import (
+    SegmentedCalibratorBundle,
+    load as load_calibrator,
+    load_oof,
+    load_segmented,
+)
 from identity_bridge import norm_player_name
 
 log = logging.getLogger(__name__)
 
 MAX_BID_ASK_SPREAD = 0.25
 _CALIBRATOR = None
+_OOF_CALIBRATOR = None
+_SEGMENTED: SegmentedCalibratorBundle | None | bool = None
 
 
 def reset_calibration_cache() -> None:
     """Clear the lazy isotonic calibrator cache (for tests / reload)."""
-    global _CALIBRATOR
+    global _CALIBRATOR, _OOF_CALIBRATOR, _SEGMENTED
     _CALIBRATOR = None
+    _OOF_CALIBRATOR = None
+    _SEGMENTED = None
 
 
-def _calibrate(p: float) -> float:
+def _get_oof_calibrator():
+    global _OOF_CALIBRATOR
+    if _OOF_CALIBRATOR is False:
+        return None
+    if _OOF_CALIBRATOR is None:
+        try:
+            _OOF_CALIBRATOR = load_oof() if USE_OOF_CALIBRATION else False
+        except Exception:
+            _OOF_CALIBRATOR = False
+    if _OOF_CALIBRATOR is False or _OOF_CALIBRATOR is None:
+        return None
+    return _OOF_CALIBRATOR
+
+
+def _get_segmented() -> SegmentedCalibratorBundle | None:
+    global _SEGMENTED
+    if _SEGMENTED is False:
+        return None
+    if _SEGMENTED is None:
+        try:
+            _SEGMENTED = load_segmented() if USE_SEGMENTED_CALIBRATION else False
+        except Exception:
+            _SEGMENTED = False
+    if _SEGMENTED is False or _SEGMENTED is None:
+        return None
+    return _SEGMENTED
+
+
+def _calibrate(p: float, *, line: float = 1.5, side: str = "yes", games_played: int = 0) -> float:
     global _CALIBRATOR
     if not USE_ISOTONIC_CALIBRATION:
         return float(p)
+    oof = _get_oof_calibrator()
+    if oof is not None:
+        try:
+            return float(oof.transform(float(p)))
+        except Exception:
+            pass
+    seg = _get_segmented()
+    if seg is not None:
+        try:
+            return float(seg.transform(float(p), line=line, side=side, games_played=games_played))
+        except Exception:
+            pass
     if _CALIBRATOR is None:
         try:
             _CALIBRATOR = load_calibrator()
@@ -62,21 +114,33 @@ def _calibrate(p: float) -> float:
         return float(p)
 
 
-def calibrate_over_under(p_over_raw: float) -> tuple[float, float]:
+def calibrate_over_under(
+    p_over_raw: float,
+    *,
+    line: float = 1.5,
+    games_played: int = 0,
+) -> tuple[float, float]:
     """
     Calibrate P(over) only; P(under) = 1 - P(over) so YES/NO views stay mutually consistent.
     """
     p = float(p_over_raw)
     p = min(1.0 - 1e-6, max(1e-6, p))
-    p_over_c = float(_calibrate(p))
+    p_over_c = float(_calibrate(p, line=line, side="yes", games_played=games_played))
     p_over_c = min(1.0 - 1e-6, max(1e-6, p_over_c))
     return p_over_c, 1.0 - p_over_c
 
 
-def fill_calibrated_probabilities(results: list[ProbabilityResult]) -> None:
+def fill_calibrated_probabilities(
+    results: list[ProbabilityResult],
+    *,
+    games_played_by_player: dict[str, int] | None = None,
+) -> None:
     """Set ``p_over_calibrated`` / ``p_under_calibrated`` once per row (avoids repeated isotonic work)."""
+    gp_map = games_played_by_player or {}
     for r in results:
-        oc, uc = calibrate_over_under(r.p_over)
+        gp = int(r.games_played if r.games_played is not None else gp_map.get(r.player_name, 0) or 0)
+        r.games_played = gp
+        oc, uc = calibrate_over_under(r.p_over, line=float(r.kalshi_line), games_played=gp)
         r.p_over_calibrated = oc
         r.p_under_calibrated = uc
 
@@ -102,6 +166,7 @@ class EdgeSignal:
     book_bid: float
     book_ask: float
     book_spread: float
+    games_played: int = 0
 
 
 def expected_pnl_per_contract_mean_var(p: float, limit_price: float) -> tuple[float, float]:
@@ -191,7 +256,10 @@ def detect_edge(
     if prob_result.p_over_calibrated is not None and prob_result.p_under_calibrated is not None:
         p_over, p_under = float(prob_result.p_over_calibrated), float(prob_result.p_under_calibrated)
     else:
-        p_over, p_under = calibrate_over_under(prob_result.p_over)
+        gp = int(prob_result.games_played or 0)
+        p_over, p_under = calibrate_over_under(
+            prob_result.p_over, line=float(prob_result.kalshi_line), games_played=gp
+        )
 
     if not (MIN_REALISTIC_ASK <= float(market_line.yes_ask) <= MAX_REALISTIC_ASK):
         yes_edge = -1.0
@@ -225,7 +293,7 @@ def detect_edge(
     p_raw_side = p_over_raw if side == "yes" else p_under_raw
     b = (1.0 - c) / c if c > 0 else 0.0
     ev = b * p - (1.0 - p)
-    if ev <= 0 or ev > 2.0:
+    if ev <= float(MIN_EV) or ev > 2.0:
         return None
 
     kf = fractional_kelly(p, b)
@@ -262,6 +330,7 @@ def detect_edge(
         book_bid=book_bid,
         book_ask=book_ask,
         book_spread=book_spread,
+        games_played=int(prob_result.games_played or 0),
     )
 
 
@@ -297,7 +366,7 @@ def scan_for_edges(
 
 def apply_flow_guard(signals: list[EdgeSignal], market_lines: list[MarketLine]) -> list[EdgeSignal]:
     """
-    Drop or downsize YES-side flow when VPIN proxy indicates toxic / informed flow.
+    Drop edges on either side when VPIN proxy indicates toxic / informed flow.
     """
     if not signals:
         return []
@@ -307,13 +376,8 @@ def apply_flow_guard(signals: list[EdgeSignal], market_lines: list[MarketLine]) 
         ml = by_ticker.get(s.ticker)
         tox = float(ml.vpin_toxicity) if ml else 0.0
         if ENABLE_VPIN_GUARD and tox >= VPIN_MAX_TOXIC:
-            if str(s.recommended_side).lower() == "yes":
-                log.info("Skipping YES edge on %s (VPIN toxicity=%.3f)", s.ticker, tox)
-                continue
-            s.bet_dollars = round(float(s.bet_dollars) * 0.5, 2)
-            s.recommended_contracts = dollars_to_contracts(s.bet_dollars, s.limit_price)
-            if s.recommended_contracts <= 0:
-                continue
+            log.info("Skipping %s edge on %s (VPIN toxicity=%.3f)", s.recommended_side.upper(), s.ticker, tox)
+            continue
         out.append(s)
     return out
 
@@ -369,6 +433,7 @@ def execute_signals(
                 order_id="",
                 player_name=sig.player_name,
                 kalshi_line=sig.kalshi_line,
+                games_played=int(sig.games_played),
                 predicted_lambda=sig.predicted_lambda,
                 p_model=sig.p_model,
                 p_model_raw=float(sig.p_model_raw),
@@ -415,6 +480,7 @@ def execute_signals(
                 order_id=result.order_id,
                 player_name=sig.player_name,
                 kalshi_line=sig.kalshi_line,
+                games_played=int(sig.games_played),
                 predicted_lambda=sig.predicted_lambda,
                 p_model=sig.p_model,
                 p_model_raw=float(sig.p_model_raw),

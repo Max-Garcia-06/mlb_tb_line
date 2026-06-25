@@ -1,0 +1,13 @@
+# MLB TB Pipeline — Phase 1 cron (data + reporting only, no live scan)
+# Times are US/Eastern. Install: scripts/install_phase1_cron.sh
+#
+# @@REPO@@ = replaced with your repo path on install
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# 10:00 ET — capture Kalshi books before today's slate
+0 10 * * * TZ=America/New_York @@REPO@@/scripts/cron_job.sh snapshot
+
+# 02:00 ET — ingest finished games + reconcile/report yesterday's trades
+0 2 * * * TZ=America/New_York @@REPO@@/scripts/cron_job.sh nightly

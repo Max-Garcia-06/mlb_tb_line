@@ -761,6 +761,27 @@ def report(game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM
             agg["contracts"] += ctr
             agg["clv_sum"] += clv * ctr
 
+    # CLV coverage: how many resolved fills have at least one mark with a non-zero mid?
+    total_fills = resolved_n + unresolved
+    clv_n = sum(
+        1
+        for tr in resolved_trades
+        if any(
+            marks.get((tr["order_id"], lbl)) and (
+                float(marks[(tr["order_id"], lbl)].get("mark_yes_mid", 0.0) or 0.0) > 0
+                or float(marks[(tr["order_id"], lbl)].get("mark_no_mid", 0.0) or 0.0) > 0
+            )
+            for lbl in ("30m", "120m")
+        )
+    )
+    if total_fills > 0:
+        cov_pct = clv_n / total_fills * 100
+        cov_line = f"CLV coverage: {clv_n}/{total_fills} ({cov_pct:.0f}%)"
+        if cov_pct < 70:
+            console.print(f"[yellow]Warning: {cov_line} — CLV average excludes unmarked trades and may be unreliable.[/yellow]")
+        else:
+            console.print(f"[dim]{cov_line}[/dim]")
+
     if clv_by_label:
         tc = Table(title="CLV / mark-to-market (filled trades only)", box=box.SIMPLE_HEAD)
         tc.add_column("Label", style="cyan")
@@ -866,6 +887,36 @@ def report(game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM
     _slice_table("Slice: edge bucket", by_edge)
     if any(k != "n/a" for k in by_spread.keys()):
         _slice_table("Slice: book spread bucket", by_spread)
+
+    # Segment P&L table: line × edge_bucket (fills ≥ 2 only).
+    if resolved_trades:
+        seg: dict[tuple, dict] = defaultdict(lambda: {"n": 0, "contracts": 0, "cost": 0.0, "pnl": 0.0, "wins": 0, "edge_sum": 0.0})
+        for tr in resolved_trades:
+            key = (str(tr["line"]), edge_bucket(tr["edge"]))
+            s = seg[key]
+            s["n"] += 1
+            s["contracts"] += tr["contracts"]
+            s["cost"] += tr["price"] * tr["contracts"]
+            s["pnl"] += tr["pnl"]
+            s["wins"] += 1 if tr["pnl"] > 0 else 0
+            s["edge_sum"] += tr["edge"]
+        visible = {k: v for k, v in seg.items() if v["n"] >= 2}
+        if visible:
+            tseg = Table(title="P&L by line × edge bucket (≥2 fills)", box=box.SIMPLE_HEAD)
+            tseg.add_column("line", style="cyan", justify="right")
+            tseg.add_column("edge_bucket", style="cyan")
+            tseg.add_column("fills", justify="right")
+            tseg.add_column("contracts", justify="right")
+            tseg.add_column("roi%", justify="right")
+            tseg.add_column("win_rate", justify="right")
+            tseg.add_column("avg_edge", justify="right")
+            for (line_key, eb_key) in sorted(visible.keys(), key=lambda x: (float(x[0]), x[1])):
+                sv = visible[(line_key, eb_key)]
+                roi = (sv["pnl"] / sv["cost"]) * 100 if sv["cost"] > 0 else 0.0
+                wr = sv["wins"] / sv["n"] * 100
+                avg_e = sv["edge_sum"] / sv["n"]
+                tseg.add_row(line_key, eb_key, str(sv["n"]), str(sv["contracts"]), f"{roi:.2f}%", f"{wr:.1f}%", f"{avg_e:+.3f}")
+            console.print(tseg)
 
     if resolved_trades:
         worst = sorted(resolved_trades, key=lambda x: x["pnl"])[:10]
@@ -1511,17 +1562,21 @@ def reconcile(
 def calibrate(
     start: str = typer.Option(None, "--start", help="Start date YYYY-MM-DD (inclusive). Default: earliest journal found."),
     end: str = typer.Option(None, "--end", help="End date YYYY-MM-DD (inclusive). Default: latest journal found."),
-    min_rows: int = typer.Option(50, "--min-rows", help="Minimum resolved filled trades required to fit calibration."),
+    min_rows: int = typer.Option(None, "--min-rows", help="Minimum resolved filled trades for global calibrator (default: MIN_CALIB_ROWS_GLOBAL)."),
 ):
     """
-    Fit an isotonic probability calibrator from reconciled filled trades.
+    Fit segmented isotonic calibrators from reconciled **fill** rows only.
 
-    Uses journal `note=fill` to determine filled size, and Kalshi market result to determine win/loss.
+    Uses journal ``note=fill`` (run ``reconcile`` first) and Kalshi market ``result`` for outcomes.
+    Writes ``models/p_calibrator_segmented.pkl`` and ``models/calibrator_meta.json``.
+
+    At live ``scan``, ``USE_OOF_CALIBRATION`` applies the OOF calibrator first when present;
+    this fill-based bundle is the fallback (see ``edge_detector._calibrate``).
     """
     import numpy as np
 
-    from calibration import fit_isotonic, save
-    from config import DATA_DIR
+    from calibration import fit_isotonic, fit_segmented, save, save_segmented
+    from config import DATA_DIR, MIN_CALIB_ROWS_GLOBAL, MIN_CALIB_ROWS_SEGMENT
     from journal_reader import date_from_journal_filename, journal_paths_sorted, load_jsonl_rows, parse_iso_date
     from kalshi_bridge import get_client
     from reporting_common import market_yes_no_result
@@ -1578,9 +1633,8 @@ def calibrate(
     def outcome_for(ticker: str) -> str:
         return market_yes_no_result(by_ticker.get(ticker, {}))
 
-    ps = []
-    ys = []
-    w = []
+    min_global = int(min_rows) if min_rows is not None else int(MIN_CALIB_ROWS_GLOBAL)
+    fit_rows: list[dict] = []
     for r in fill_rows:
         ticker = str(r.get("ticker", ""))
         res = outcome_for(ticker)
@@ -1594,24 +1648,166 @@ def calibrate(
         filled = int(r.get("filled_contracts", 0) or 0)
         if filled <= 0:
             continue
-        ps.append(p_for_fit)
-        ys.append(y)
-        w.append(float(filled))
+        line = float(r.get("kalshi_line", r.get("line", 1.5)) or 1.5)
+        gp = int(r.get("games_played", 0) or 0)
+        fit_rows.append({"p": p_for_fit, "y": y, "weight": float(filled), "line": line, "side": side, "games_played": gp})
 
-    if len(ps) < min_rows:
-        _warn(f"Not enough resolved filled trades to calibrate ({len(ps)}<{min_rows}). Try a wider date range or pass --min-rows lower (risk: overfitting).")
+    if len(fit_rows) < min_global:
+        _warn(
+            f"Not enough resolved filled trades to calibrate ({len(fit_rows)}<{min_global}). "
+            "Try a wider date range or pass --min-rows lower (risk: overfitting)."
+        )
         raise typer.Exit(0)
 
-    # Weighted isotonic isn't directly exposed in sklearn's IsotonicRegression via fit args in all versions,
-    # so approximate by repeating probabilities (cap to keep it reasonable).
-    rep_ps = []
-    rep_ys = []
-    for p0, y0, w0 in zip(ps, ys, w):
-        reps = int(min(20, max(1, round(w0 / 2))))
-        rep_ps.extend([p0] * reps)
-        rep_ys.extend([y0] * reps)
+    bundle = fit_segmented(fit_rows, min_global=min_global, min_segment=MIN_CALIB_ROWS_SEGMENT)
+    if bundle is None:
+        _warn("Segmented calibration fit failed.")
+        raise typer.Exit(1)
+    save_segmented(bundle)
+    n_seg = len(bundle.segments)
+    from calibrate_preflight import write_calibrator_meta
+    write_calibrator_meta(
+        n_rows=len(fit_rows),
+        n_segments=n_seg,
+        start=start_d.strftime("%Y-%m-%d"),
+        end=end_d.strftime("%Y-%m-%d"),
+    )
+    _success(
+        f"Saved segmented fill calibrator ({n_seg} segment(s) with n>={MIN_CALIB_ROWS_SEGMENT}) "
+        f"from {len(fit_rows)} resolved fills. "
+        "At scan, OOF calibrator is applied first when USE_OOF_CALIBRATION=true; "
+        "segmented fill calibrator is fallback."
+    )
 
-    cal = fit_isotonic(np.array(rep_ps, dtype=float), np.array(rep_ys, dtype=float))
-    save(cal)
-    _success(f"Saved calibrator to models/ (isotonic). Rows used: {len(rep_ps)} (from {len(ps)} trades)")
+
+def segment_report(
+    start: str = typer.Option(None, "--start", help="Start date YYYY-MM-DD. Default: 14 days ago."),
+    end: str = typer.Option(None, "--end", help="End date YYYY-MM-DD. Default: today."),
+):
+    """Segment health report: go/no-go verdict per (side, line, spread, edge) bucket."""
+    from datetime import date, timedelta
+    from segment_health import segment_health_for_range
+    from kalshi_bridge import get_client
+
+    today = date.today()
+    end_d = end or today.strftime("%Y-%m-%d")
+    start_d = start or (today - timedelta(days=14)).strftime("%Y-%m-%d")
+
+    _header(f"Segment Health — {start_d} → {end_d}")
+    try:
+        client = get_client()
+    except Exception:
+        client = None
+
+    report = segment_health_for_range(start_d, end_d, client=client)
+    console.print(f"Recommendation: [bold]{'green' if report.recommendation == 'TRADE' else 'red'}]{report.recommendation}[/]")
+    for reason in report.summary_reasons:
+        console.print(f"  • {reason}")
+    console.print()
+
+    if report.segments:
+        t = Table(title="Segment Verdicts", box=box.SIMPLE_HEAD)
+        t.add_column("Segment", style="cyan")
+        t.add_column("Status", justify="center")
+        t.add_column("Orders", justify="right")
+        t.add_column("Fills", justify="right")
+        t.add_column("Fill%", justify="right")
+        t.add_column("ROI%", justify="right")
+        t.add_column("Avg CLV", justify="right")
+        for v in report.segments:
+            m = v.metrics
+            fill_pct = f"{m.fill_rate * 100:.0f}%" if m.orders > 0 else "—"
+            roi = f"{m.roi_pct:.1f}%" if m.fills > 0 else "—"
+            clv = f"{m.avg_clv_per_contract:+.4f}" if m.fills > 0 else "—"
+            color = "green" if v.status == "PASS" else ("yellow" if v.status == "INSUFFICIENT" else "red")
+            t.add_row(m.segment_key, f"[{color}]{v.status}[/{color}]", str(m.orders), str(m.fills), fill_pct, roi, clv)
+        console.print(t)
+
+
+def snapshot(
+    game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM-DD. Defaults to today."),
+    series_ticker: str = typer.Option("KXMLBTB", "--series-ticker"),
+):
+    """Capture a point-in-time snapshot of TB market prices for backtesting / CLV."""
+    from datetime import date as _date
+    from kalshi_bridge import get_client, get_total_bases_lines, parse_total_bases_markets
+    from market_snapshots import append_snapshots
+
+    gd = game_date or _date.today().strftime("%Y-%m-%d")
+    _header(f"Snapshot TB markets — {gd}")
+    client = get_client()
+    raw = get_total_bases_lines(gd, client=client, series_ticker=series_ticker)
+    lines = parse_total_bases_markets(raw, game_date=gd)
+    n = append_snapshots(gd, lines)
+    _success(f"Saved {n} market snapshots for {gd}.")
+
+
+def schedule_snapshots(
+    game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM-DD. Defaults to today."),
+    interval: int = typer.Option(30, "--interval-minutes", help="Minutes between snapshots."),
+    count: int = typer.Option(4, "--count", help="Number of snapshots to capture."),
+    series_ticker: str = typer.Option("KXMLBTB", "--series-ticker"),
+):
+    """Capture repeated market snapshots at regular intervals (blocking)."""
+    import time
+    from datetime import date as _date
+    from kalshi_bridge import get_client, get_total_bases_lines, parse_total_bases_markets
+    from market_snapshots import append_snapshots
+
+    gd = game_date or _date.today().strftime("%Y-%m-%d")
+    _header(f"Scheduled snapshots — {gd} × {count} every {interval}m")
+    client = get_client()
+    for i in range(count):
+        raw = get_total_bases_lines(gd, client=client, series_ticker=series_ticker)
+        lines = parse_total_bases_markets(raw, game_date=gd)
+        n = append_snapshots(gd, lines)
+        console.print(f"[{i+1}/{count}] Saved {n} snapshots.")
+        if i < count - 1:
+            time.sleep(interval * 60)
+    _success(f"Done. {count} snapshot(s) captured for {gd}.")
+
+
+def backtest(
+    start: str = typer.Option(..., "--start", help="Start date YYYY-MM-DD."),
+    end: str = typer.Option(..., "--end", help="End date YYYY-MM-DD."),
+    bankroll: float = typer.Option(1000.0, "--bankroll"),
+    pit_train: bool = typer.Option(False, "--pit-train/--no-pit-train", help="Point-in-time model retraining."),
+):
+    """Replay market snapshots against actual TB outcomes to estimate P&L."""
+    from backtest import run_backtest_range, BacktestReport
+
+    _header(f"Backtest — {start} → {end}")
+    reports = run_backtest_range(start, end, bankroll=bankroll, pit_train=pit_train)
+    if not reports:
+        _warn("No backtest results (missing snapshots for date range).")
+        raise typer.Exit(0)
+
+    total_cost = sum(r.total_cost for r in reports)
+    total_pnl = sum(r.total_pnl for r in reports)
+    total_trades = sum(r.n_trades for r in reports)
+    roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
+
+    t = Table(title=f"Backtest Summary ({len(reports)} days)", box=box.SIMPLE_HEAD)
+    t.add_column("Date", style="cyan")
+    t.add_column("Trades", justify="right")
+    t.add_column("Cost $", justify="right")
+    t.add_column("P&L $", justify="right")
+    t.add_column("ROI%", justify="right")
+    for r in sorted(reports, key=lambda x: x.game_date):
+        day_roi = (r.total_pnl / r.total_cost * 100) if r.total_cost > 0 else 0.0
+        color = "green" if r.total_pnl >= 0 else "red"
+        t.add_row(r.game_date, str(r.n_trades), f"{r.total_cost:.2f}", f"[{color}]{r.total_pnl:+.2f}[/{color}]", f"{day_roi:.1f}%")
+    console.print(t)
+    roi_color = "green" if total_pnl >= 0 else "red"
+    console.print(f"\nTotal: {total_trades} trades | Cost ${total_cost:.2f} | P&L [{roi_color}]{total_pnl:+.2f}[/{roi_color}] | ROI {roi:.1f}%")
+
+
+def materialize_features(
+    as_of_date: str = typer.Option(None, "--as-of", help="Only include rows strictly before this date (YYYY-MM-DD)."),
+):
+    """Persist batter_features to SQLite gold table for faster scan and point-in-time backtest replay."""
+    from feature_store import materialize_feature_table
+    _header("Materialize feature table")
+    n = materialize_feature_table(as_of_date=as_of_date)
+    _success(f"Materialized {n} feature rows to batter_features table.")
 

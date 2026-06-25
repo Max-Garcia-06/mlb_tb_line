@@ -74,6 +74,7 @@ class ProbabilityResult:
     pmf: tuple[float, ...] | None = None
     p_over_calibrated: float | None = None
     p_under_calibrated: float | None = None
+    games_played: int | None = None
 
 
 def calculate_probabilities(

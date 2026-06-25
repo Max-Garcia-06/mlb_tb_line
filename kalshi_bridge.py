@@ -407,8 +407,33 @@ class KalshiClient:
         return float(vpin_from_signed_volumes(seq, bucket_target=bucket))
 
     def get_balance(self) -> float:
+        """
+        Available trading balance in dollars.
+
+        Kalshi v2 returns ``balance`` in cents at the top level (not a nested object).
+        """
         data = self._get("/portfolio/balance")
-        return float(data.get("balance", {}).get("available_balance", 0)) / 100
+        if not isinstance(data, dict):
+            return 0.0
+        bd = data.get("balance_dollars")
+        if bd is not None:
+            try:
+                return max(0.0, float(str(bd)))
+            except (TypeError, ValueError):
+                pass
+        bal = data.get("balance")
+        if isinstance(bal, (int, float)):
+            return max(0.0, float(bal) / 100.0)
+        if isinstance(bal, dict):
+            for key in ("available_balance", "balance", "available"):
+                v = bal.get(key)
+                if isinstance(v, (int, float)):
+                    return max(0.0, float(v) / 100.0)
+        for key in ("available_balance", "balance"):
+            v = data.get(key)
+            if isinstance(v, (int, float)):
+                return max(0.0, float(v) / 100.0)
+        return 0.0
 
 
 def attach_vpin_proxy_batch(

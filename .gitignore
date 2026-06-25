@@ -20,10 +20,17 @@ build/
 .idea/
 .vscode/
 
+# Cron / local logs
+logs/
+
 # Local data (DB, journals, ledger — regenerate or keep private)
 data/*.db
 data/*.jsonl
 data/execution_ledger.json
 
-# Trained binaries (retrain with `python run_pipeline.py train`)
+# Trained binaries and calibration artifacts (retrain with `python run_pipeline.py train`)
 models/*.pkl
+models/*.json
+
+# Market snapshots (regenerate with `snapshot` command)
+data/snapshots/

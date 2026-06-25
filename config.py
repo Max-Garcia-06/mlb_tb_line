@@ -67,7 +67,11 @@ GAMES_FOR_LAMBDA_SANITY = int(os.getenv("GAMES_FOR_LAMBDA_SANITY", "50"))
 DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "mlb_tb.db"))
 
 # Seasons (years) to pull
-SEASONS = [2022, 2023, 2024, 2025]
+SEASONS = [int(x) for x in os.getenv("SEASONS", "2022,2023,2024,2025,2026").split(",") if x.strip()]
+
+# MLB Stats API retries (ETL / schedule)
+MLB_API_MAX_RETRIES = int(os.getenv("MLB_API_MAX_RETRIES", "5"))
+MLB_API_RETRY_SLEEP_SEC = float(os.getenv("MLB_API_RETRY_SLEEP_SEC", "2.0"))
 
 # Rolling window (games) for trailing features
 ROLLING_WINDOW = 15
@@ -78,9 +82,63 @@ MIN_GAMES = 20
 # Walk-forward CV controls (split by unique game_date)
 CV_GAP_DATES = int(os.getenv("CV_GAP_DATES", "1"))  # embargo gap between train and test folds (in unique dates)
 
-# Evaluation lines (TB) for probability scoring
+# Evaluation lines (TB) for probability scoring and CV model selection
 EVAL_LINES = [float(x) for x in os.getenv("EVAL_LINES", "0.5,1.5,2.5,3.5").split(",")]
+
+# Hard gate: require positive expected value (per contract) to emit a signal
+MIN_EV = float(os.getenv("MIN_EV", "0.0"))
+
+# Segmented isotonic calibration (line × side × games_played bucket)
+MIN_CALIB_ROWS_GLOBAL = int(os.getenv("MIN_CALIB_ROWS_GLOBAL", "50"))
+MIN_CALIB_ROWS_SEGMENT = int(os.getenv("MIN_CALIB_ROWS_SEGMENT", "30"))
+USE_SEGMENTED_CALIBRATION = os.getenv("USE_SEGMENTED_CALIBRATION", "true").lower() in ("1", "true", "yes")
+
+# Walk-forward model selection: mean_brier (default) or mean_logloss
+CV_PRIMARY_METRIC = os.getenv("CV_PRIMARY_METRIC", "mean_brier").strip().lower()
 
 # Distribution to use: "poisson" or "nbinom"
 DISTRIBUTION = os.getenv("DISTRIBUTION", "nbinom")
+
+# Live scan: only include games starting within this many hours (0 = full pre-game slate)
+SCAN_WITHIN_HOURS = float(os.getenv("SCAN_WITHIN_HOURS", "2"))
+
+# Segment health (segment-report go/no-go)
+SEGMENT_MIN_FILLS = int(os.getenv("SEGMENT_MIN_FILLS", "5"))
+SEGMENT_MIN_FILL_RATE = float(os.getenv("SEGMENT_MIN_FILL_RATE", "0.25"))
+SEGMENT_MIN_AVG_CLV = float(os.getenv("SEGMENT_MIN_AVG_CLV", "0.0"))
+SEGMENT_MIN_ROI_PCT = float(os.getenv("SEGMENT_MIN_ROI_PCT", "-5.0"))
+SEGMENT_REPORT_LOOKBACK_DAYS = int(os.getenv("SEGMENT_REPORT_LOOKBACK_DAYS", "14"))
+
+# Fill calibrator preflight (OOF still takes priority at inference when enabled)
+CALIBRATE_MAX_AGE_DAYS = int(os.getenv("CALIBRATE_MAX_AGE_DAYS", "14"))
+REQUIRE_FILL_CALIB_FOR_LIVE = os.getenv("REQUIRE_FILL_CALIB_FOR_LIVE", "").lower() in ("1", "true", "yes")
+
+# Live risk desk
+USE_LIVE_BALANCE = os.getenv("USE_LIVE_BALANCE", "true").lower() in ("1", "true", "yes")
+DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "0"))  # 0 = disabled
+MAX_ORDERS_PER_DAY = int(os.getenv("MAX_ORDERS_PER_DAY", "0"))  # 0 = disabled
+MAX_DAILY_DEPLOYED_USD = float(os.getenv("MAX_DAILY_DEPLOYED_USD", "0"))  # 0 = disabled
+MAX_OPEN_RESTING_USD = float(os.getenv("MAX_OPEN_RESTING_USD", "0"))  # 0 = disabled
+MAX_CONTRACTS_PER_GAME = int(os.getenv("MAX_CONTRACTS_PER_GAME", "0"))  # 0 = disabled
+MAX_LEGS_PER_PLAYER_DAY = int(os.getenv("MAX_LEGS_PER_PLAYER_DAY", "0"))  # 0 = disabled
+RESERVE_RESTING_FROM_BANKROLL = os.getenv("RESERVE_RESTING_FROM_BANKROLL", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+AUTO_KILL_ON_RISK_BREACH = os.getenv("AUTO_KILL_ON_RISK_BREACH", "true").lower() in ("1", "true", "yes")
+KILL_SWITCH_PATH = Path(os.getenv("KILL_SWITCH_PATH", str(DATA_DIR / "KILL_SWITCH")))
+
+# OOF isotonic calibration (fit from walk-forward CV; separate from fill-based calibrator)
+USE_OOF_CALIBRATION = os.getenv("USE_OOF_CALIBRATION", "true").lower() in ("1", "true", "yes")
+
+# Backtest
+BACKTEST_PIT_TRAIN = os.getenv("BACKTEST_PIT_TRAIN", "true").lower() in ("1", "true", "yes")
+BACKTEST_PIT_RETRAIN_DAYS = int(os.getenv("BACKTEST_PIT_RETRAIN_DAYS", "7"))
+BACKTEST_USE_EARLIEST_SNAPSHOT = os.getenv("BACKTEST_USE_EARLIEST_SNAPSHOT", "true").lower() in ("1", "true", "yes")
+BACKTEST_FILL_MODEL = os.getenv("BACKTEST_FILL_MODEL", "true").lower() in ("1", "true", "yes")
+
+# Feature materialization (gold layer in SQLite)
+MATERIALIZE_FEATURES_ON_ETL = os.getenv("MATERIALIZE_FEATURES_ON_ETL", "true").lower() in ("1", "true", "yes")
+FEATURES_TABLE = os.getenv("FEATURES_TABLE", "batter_features")
 

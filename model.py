@@ -22,7 +22,7 @@ from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBRegressor
 
-from config import CV_GAP_DATES, EVAL_LINES, MODEL_DIR, USE_LEGACY_XGB
+from config import CV_GAP_DATES, CV_PRIMARY_METRIC, EVAL_LINES, MODEL_DIR, USE_LEGACY_XGB
 from feature_store import MODEL_FEATURES, build_feature_table
 from ordinal_core import (
     NUM_TB_LEVELS,
@@ -62,6 +62,99 @@ def prepare_data() -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
     X = df[MODEL_FEATURES].copy()
     y = df["tb"].astype(float).values
     return X, y, df
+
+
+def prepare_data_as_of(as_of_date: str) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
+    """Training rows strictly before ``as_of_date`` (point-in-time, no lookahead)."""
+    df = build_feature_table().dropna(subset=["tb"] + MODEL_FEATURES).sort_values("game_date")
+    cutoff = pd.Timestamp(as_of_date)
+    df = df[pd.to_datetime(df["game_date"]) < cutoff].copy()
+    if df.empty:
+        raise ValueError(f"No training rows before {as_of_date}")
+    X = df[MODEL_FEATURES].copy()
+    y = df["tb"].astype(float).values
+    return X, y, df
+
+
+def train_as_of(as_of_date: str) -> tuple[object, dict]:
+    """Train in-memory model using only data before ``as_of_date``."""
+    X, y, df = prepare_data_as_of(as_of_date)
+    if _use_xgb_head(None):
+        return _train_xgb_legacy(X, y, df, save=False)
+    return _train_ordinal(X, y, df, save=False)
+
+
+def collect_oof_calibration_rows(
+    n_splits: int = 5,
+    gap_dates: int | None = None,
+) -> list[dict]:
+    """Build OOF (p, y, line) rows from walk-forward CV for isotonic calibration."""
+    from config import CV_GAP_DATES, EVAL_LINES
+
+    gap = CV_GAP_DATES if gap_dates is None else int(gap_dates)
+    df = build_feature_table().dropna(subset=["tb"] + MODEL_FEATURES).sort_values("game_date").reset_index(drop=True)
+    X = df[MODEL_FEATURES].copy()
+    y = df["tb"].astype(float).values
+    dates = pd.to_datetime(df["game_date"]).dt.normalize()
+    uniq = np.array(sorted(dates.unique()))
+    if len(uniq) < (n_splits + 2):
+        return []
+
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    rows: list[dict] = []
+
+    for fold, (train_d_idx, test_d_idx) in enumerate(tscv.split(uniq), start=1):
+        train_dates = uniq[train_d_idx]
+        test_dates = uniq[test_d_idx]
+        if gap and gap > 0:
+            embargo_start = train_dates[-1]
+            if len(train_dates) > gap:
+                train_dates = train_dates[: -gap]
+                embargo_start = train_dates[-1]
+            test_dates = test_dates[test_dates > embargo_start]
+
+        train_mask = dates.isin(train_dates)
+        test_mask = dates.isin(test_dates)
+        train_idx = np.flatnonzero(train_mask.values)
+        test_idx = np.flatnonzero(test_mask.values)
+        if len(train_idx) == 0 or len(test_idx) == 0:
+            continue
+
+        if _use_xgb_head(None):
+            m = _make_model(random_state=42 + fold)
+            m.fit(X.iloc[train_idx], y[train_idx])
+            oof_pred = m.predict(X.iloc[test_idx])
+            resid_var = float(np.var(y[train_idx] - m.predict(X.iloc[train_idx])))
+            for ii, ti in enumerate(test_idx):
+                lam = float(oof_pred[ii])
+                tb_actual = float(y[ti])
+                for line in EVAL_LINES:
+                    p_over = float(prob_exceed(lam, float(line), resid_var))
+                    rows.append({"p": p_over, "y": 1.0 if tb_actual > float(line) else 0.0, "line": float(line)})
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                res = fit_ordinal_logit(X.iloc[train_idx], y[train_idx], disp=False)
+            pmf_te = predict_pmf(res, X.iloc[test_idx])
+            for ii, ti in enumerate(test_idx):
+                pmf = pmf_te[ii]
+                tb_actual = float(y[ti])
+                for line in EVAL_LINES:
+                    p_over = float(prob_over_line_from_pmf(pmf, float(line)))
+                    rows.append({"p": p_over, "y": 1.0 if tb_actual > float(line) else 0.0, "line": float(line)})
+    return rows
+
+
+def fit_and_save_oof_calibrator(n_splits: int = 5) -> bool:
+    """Run CV, fit OOF isotonic calibrator, persist to models/."""
+    from calibration import fit_oof_from_rows, save_oof
+
+    rows = collect_oof_calibration_rows(n_splits=n_splits)
+    cal = fit_oof_from_rows(rows)
+    if cal is None:
+        return False
+    save_oof(cal)
+    return True
 
 
 def _make_model(random_state: int = 42, params_override: dict | None = None) -> XGBRegressor:
@@ -142,6 +235,11 @@ def _train_ordinal(X: pd.DataFrame, y: np.ndarray, df: pd.DataFrame, save: bool)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         res = fit_ordinal_logit(X, y, disp=False)
+    # fit_ordinal_logit silently drops zero-variance columns; persist only the
+    # columns that actually contributed to the fit so live inference stays
+    # column-aligned with the underlying OrderedModel exog.
+    kept_cols = list(getattr(res, "_kept_feature_cols", X.columns))
+    dropped_cols = [c for c in X.columns if c not in kept_cols]
     pmf_all = predict_pmf(res, X)
     lam_hat = np.array([expected_tb_from_pmf(pmf_all[i]) for i in range(len(X))])
     resid = y - lam_hat
@@ -150,14 +248,24 @@ def _train_ordinal(X: pd.DataFrame, y: np.ndarray, df: pd.DataFrame, save: bool)
         "train_rows": int(len(X)),
         "residual_std": float(np.std(resid)),
         "residual_var": float(np.var(resid)),
-        "feature_names": list(X.columns),
+        "feature_names": kept_cols,
+        "all_input_features": list(X.columns),
+        "dropped_constant_features": dropped_cols,
         "trained_on": str(df["game_date"].max()),
         "num_tb_levels": int(NUM_TB_LEVELS),
     }
     if save:
         MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(MODEL_PATH, "wb") as f:
-            pickle.dump({"kind": "ordinal", "result": res, "feature_names": list(X.columns)}, f)
+            pickle.dump(
+                {
+                    "kind": "ordinal",
+                    "result": res,
+                    "feature_names": kept_cols,
+                    "kept_feature_cols": kept_cols,
+                },
+                f,
+            )
         with open(META_PATH, "wb") as f:
             pickle.dump(meta, f)
     return res, meta
@@ -182,7 +290,18 @@ def load_model() -> tuple[object, dict]:
         blob = pickle.load(f)
     if isinstance(blob, dict) and blob.get("kind") == "ordinal":
         meta.setdefault("model_kind", "ordinal_logit")
-        return blob["result"], meta
+        res = blob["result"]
+        # Re-attach the kept-column marker so predict_pmf can keep the
+        # prediction matrix column-aligned with the fitted exog.  Older pickles
+        # written before the constant-column guard won't have this key and will
+        # fall back to result.model.exog_names inside predict_pmf.
+        kept = blob.get("kept_feature_cols") or blob.get("feature_names")
+        if kept and not hasattr(res, "_kept_feature_cols"):
+            try:
+                setattr(res, "_kept_feature_cols", list(kept))
+            except Exception:
+                pass
+        return res, meta
     if isinstance(blob, dict) and blob.get("kind") == "xgb":
         meta.setdefault("model_kind", "xgb_tweedie")
         return blob["model"], meta
@@ -324,14 +443,21 @@ def walk_forward_cv_by_date(
                 p_over[ii] = prob_over_line_from_pmf(pmf, float(line))
         p_over = np.clip(p_over, eps, 1 - eps)
         y_over = (y[valid] > float(line)).astype(float)
-        prob_metrics[f"brier@{line:g}"] = float(np.mean((p_over - y_over) ** 2))
-        prob_metrics[f"logloss@{line:g}"] = float(-np.mean(y_over * np.log(p_over) + (1.0 - y_over) * np.log(1.0 - p_over)))
+        brier = float(np.mean((p_over - y_over) ** 2))
+        logloss = float(-np.mean(y_over * np.log(p_over) + (1.0 - y_over) * np.log(1.0 - p_over)))
+        prob_metrics[f"brier@{line:g}"] = brier
+        prob_metrics[f"logloss@{line:g}"] = logloss
+
+    brier_vals = [v for k, v in prob_metrics.items() if k.startswith("brier@")]
+    logloss_vals = [v for k, v in prob_metrics.items() if k.startswith("logloss@")]
 
     return {
         "mean_mae": float(np.mean(maes)) if maes else float("nan"),
         "std_mae": float(np.std(maes)) if maes else float("nan"),
         "fold_rows_mean": float(np.mean(fold_rows)) if fold_rows else 0.0,
         "oof_residual_var": variance,
+        "mean_brier": float(np.mean(brier_vals)) if brier_vals else float("nan"),
+        "mean_logloss": float(np.mean(logloss_vals)) if logloss_vals else float("nan"),
         **prob_metrics,
     }
 
@@ -418,10 +544,12 @@ def _score_cv_for_params(
         prob_metrics[f"logloss@{line:g}"] = logloss
         loglosses.append(logloss)
 
+    brier_vals = [v for k, v in prob_metrics.items() if k.startswith("brier@")]
     return {
         "mean_mae": float(np.mean(maes)) if maes else float("nan"),
         "oof_residual_var": variance,
         "mean_logloss": float(np.mean(loglosses)) if loglosses else float("nan"),
+        "mean_brier": float(np.mean(brier_vals)) if brier_vals else float("nan"),
         **prob_metrics,
     }
 
@@ -438,8 +566,25 @@ def tune_hyperparameters(
         df = build_feature_table().dropna(subset=["tb"] + MODEL_FEATURES).sort_values("game_date").reset_index(drop=True)
         X = df[MODEL_FEATURES].copy()
         y = df["tb"].astype(float).values
-        score = walk_forward_cv_by_date(df, X, y, n_splits=int(n_splits), gap_dates=int(gap_dates))
-        return {}, score
+        feature_subsets = [list(MODEL_FEATURES)]
+        # Lightweight ordinal feature ablation trials
+        base_matchup = [f for f in MODEL_FEATURES if f in (
+            "is_home", "lineup_slot_norm", "expected_pa_proxy", "opp_tb_allowed_roll", "opp_sp_hand_L", "platoon_tb_adj"
+        )]
+        if base_matchup:
+            feature_subsets.append([f for f in MODEL_FEATURES if f not in base_matchup])
+        best_score: dict | None = None
+        best_feats: list[str] = MODEL_FEATURES
+        for feats in feature_subsets:
+            Xsub = df[feats].copy()
+            score = walk_forward_cv_by_date(df, Xsub, y, n_splits=int(n_splits), gap_dates=int(gap_dates))
+            if _cv_score_better(score, best_score):
+                best_score = score
+                best_feats = feats
+        meta_path = MODEL_DIR / "ordinal_feature_subset.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps({"feature_names": best_feats}, indent=2))
+        return {"feature_names": best_feats}, best_score or {}
 
     rng = np.random.default_rng(int(random_seed))
     df = build_feature_table().dropna(subset=["tb"] + MODEL_FEATURES).sort_values("game_date").reset_index(drop=True)
@@ -465,7 +610,7 @@ def tune_hyperparameters(
         }
 
         score = _score_cv_for_params(df=df, X=X, y=y, params=params, n_splits=int(n_splits), gap_dates=int(gap_dates))
-        if best_score is None or float(score["mean_logloss"]) < float(best_score["mean_logloss"]):
+        if _cv_score_better(score, best_score):
             best_params = params
             best_score = score
 
@@ -475,3 +620,14 @@ def tune_hyperparameters(
     save_path.parent.mkdir(parents=True, exist_ok=True)
     save_path.write_text(json.dumps(best_params, indent=2, sort_keys=True))
     return best_params, best_score
+
+
+def _cv_primary_value(score: dict) -> float:
+    key = "mean_logloss" if CV_PRIMARY_METRIC == "mean_logloss" else "mean_brier"
+    return float(score.get(key, float("nan")))
+
+
+def _cv_score_better(score: dict, best: dict | None) -> bool:
+    if best is None:
+        return True
+    return _cv_primary_value(score) < _cv_primary_value(best)

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import uuid
 
 import typer
 
 from pipeline import commands as cmd
+from structured_logging import configure_structured_logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+configure_structured_logging(run_id=str(uuid.uuid4())[:8])
 
 app = typer.Typer(add_completion=False, help="MLB Total Bases Edge Pipeline")
 
@@ -22,6 +25,11 @@ app.command()(cmd.report)
 app.command("report-range")(cmd.report_range)
 app.command()(cmd.reconcile)
 app.command()(cmd.calibrate)
+app.command("segment-report")(cmd.segment_report)
+app.command()(cmd.snapshot)
+app.command("schedule-snapshots")(cmd.schedule_snapshots)
+app.command()(cmd.backtest)
+app.command("materialize-features")(cmd.materialize_features)
 
 
 def main() -> None:
