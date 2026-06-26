@@ -57,13 +57,15 @@ tz = ZoneInfo('America/New_York')
 print((datetime.now(tz).date() - timedelta(days=1)).isoformat())
 ")"
 
+SCAN_LOG="${LOG_DIR}/scan.log"
+
 case "$JOB" in
   snapshot)
     # Pre-game tape for today's slate
     run_py snapshot --date "$TODAY_ET"
     ;;
   etl)
-    run_py etl --incremental --workers 8
+    run_py etl
     ;;
   reconcile)
     # After games: journal for yesterday's slate (2 AM job is usually post-evening slate)
@@ -74,8 +76,26 @@ case "$JOB" in
     ;;
   nightly)
     # ETL then settle yesterday's journal (report reconciles fills by default)
-    run_py etl --incremental --workers 8
+    run_py etl
     run_py report --date "$YESTERDAY_ET"
+    ;;
+  scan)
+    # Dry-run edge scan — logs to scan.log, no orders placed
+    log "START scan (dry-run) for $TODAY_ET" | tee -a "$SCAN_LOG"
+    set +e
+    "$PYTHON" run_pipeline.py scan --date "$TODAY_ET" --dry-run >>"$SCAN_LOG" 2>&1
+    code=$?
+    set -e
+    echo "[$TS] [scan] EXIT $code" | tee -a "$SCAN_LOG"
+    ;;
+  scan-live)
+    # Live scan — places orders on Kalshi
+    log "START scan (LIVE) for $TODAY_ET" | tee -a "$SCAN_LOG"
+    set +e
+    "$PYTHON" run_pipeline.py scan --date "$TODAY_ET" --live >>"$SCAN_LOG" 2>&1
+    code=$?
+    set -e
+    echo "[$TS] [scan-live] EXIT $code" | tee -a "$SCAN_LOG"
     ;;
   *)
     log "Unknown job: $JOB"
