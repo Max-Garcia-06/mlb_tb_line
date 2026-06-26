@@ -1730,14 +1730,13 @@ def snapshot(
 ):
     """Capture a point-in-time snapshot of TB market prices for backtesting / CLV."""
     from datetime import date as _date
-    from kalshi_bridge import get_client, get_total_bases_lines, parse_total_bases_markets
+    from kalshi_bridge import get_client
     from market_snapshots import append_snapshots
 
     gd = game_date or _date.today().strftime("%Y-%m-%d")
     _header(f"Snapshot TB markets — {gd}")
     client = get_client()
-    raw = get_total_bases_lines(gd, client=client, series_ticker=series_ticker)
-    lines = parse_total_bases_markets(raw, game_date=gd)
+    lines = client.get_total_bases_lines(gd, series_ticker=series_ticker)
     n = append_snapshots(gd, lines)
     _success(f"Saved {n} market snapshots for {gd}.")
 
@@ -1751,15 +1750,14 @@ def schedule_snapshots(
     """Capture repeated market snapshots at regular intervals (blocking)."""
     import time
     from datetime import date as _date
-    from kalshi_bridge import get_client, get_total_bases_lines, parse_total_bases_markets
+    from kalshi_bridge import get_client
     from market_snapshots import append_snapshots
 
     gd = game_date or _date.today().strftime("%Y-%m-%d")
     _header(f"Scheduled snapshots — {gd} × {count} every {interval}m")
     client = get_client()
     for i in range(count):
-        raw = get_total_bases_lines(gd, client=client, series_ticker=series_ticker)
-        lines = parse_total_bases_markets(raw, game_date=gd)
+        lines = client.get_total_bases_lines(gd, series_ticker=series_ticker)
         n = append_snapshots(gd, lines)
         console.print(f"[{i+1}/{count}] Saved {n} snapshots.")
         if i < count - 1:

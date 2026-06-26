@@ -305,42 +305,31 @@ python3 run_pipeline.py segment-report --start 2026-05-01 --end 2026-05-24
 
 ---
 
-## 6. Cron automation (Phase 1)
+## 6. Cron automation
 
-Low-risk jobs only: **snapshot** + **nightly close** (ETL, report with implicit reconcile). No live `scan`.
+Three job types run automatically. All are defined between `# BEGIN mlb_tb_line` and `# END mlb_tb_line` in crontab.
 
-### Install (once)
+| Schedule (US/Eastern) | Job | What it runs | Log |
+|------------------------|-----|----------------|-----|
+| **02:00** daily | `nightly` | `etl` → `report --date yesterday` (reconcile on) | `logs/cron.log` |
+| **10:00** daily | `snapshot` | `snapshot --date today` (pre-game tape) | `logs/cron.log` |
+| **10:00–22:00** hourly | `scan-live` | `scan --live --date today` | `logs/scan.log` |
 
-```bash
-chmod +x scripts/cron_job.sh scripts/install_phase1_cron.sh
-./scripts/install_phase1_cron.sh
-```
-
-This installs:
-
-| Schedule (US/Eastern) | Job | What it runs |
-|------------------------|-----|----------------|
-| **10:00** daily | `snapshot` | `snapshot --date` today (pre-game tape) |
-| **02:00** daily | `nightly` | `etl --incremental` → `report` for **yesterday** (reconcile on) |
-
-Logs append to `logs/cron.log`.
+The hourly `scan-live` jobs replace markets at each top-of-hour. The `--within-hours` window (default 2 h, or `SCAN_WITHIN_HOURS` in `.env`) limits each run to games starting soon, so early runs don't trade night-game books.
 
 ### Manual test
 
 ```bash
 ./scripts/cron_job.sh snapshot
 ./scripts/cron_job.sh nightly
+./scripts/cron_job.sh scan-live   # live; use scan for dry-run
 ```
 
 ### Uninstall
 
-Edit crontab and remove the block between `# BEGIN mlb_tb_line phase1` and `# END mlb_tb_line phase1`, or run:
-
 ```bash
-crontab -l | awk '/BEGIN mlb_tb_line phase1/,/END mlb_tb_line phase1/{next} {print}' | crontab -
+crontab -l | awk '/BEGIN mlb_tb_line/,/END mlb_tb_line/{next} {print}' | crontab -
 ```
-
-Phase 2 (optional later): add `scan --live` to cron — see earlier ops notes; not installed by default.
 
 ### Keep Mac awake at cron times (plugged in)
 
@@ -365,7 +354,7 @@ Requires your Mac to be **plugged in** (and ideally lid open or clamshell with e
 
 | Task | Command | When |
 |------|---------|------|
-| Refresh history | `etl --incremental` | Daily after slates (also in cron `nightly`) |
+| Refresh history | `etl` | Daily after slates (also in cron `nightly`) |
 | Retrain model | `train` | Weekly or after large ETL |
 | Re-evaluate | `evaluate` | After retrain |
 | Multi-day P&L | `report-range --start ... --end ...` | Anytime |
