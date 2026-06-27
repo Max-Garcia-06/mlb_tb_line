@@ -154,6 +154,10 @@ def scan(
             "Kalshi MOCK client is active (missing or empty KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PATH in "
             f"{BASE_DIR}/.env). You only see 3 placeholder markets — not the real exchange."
         )
+    else:
+        from risk_manager import resolve_bankroll
+        bankroll = resolve_bankroll(bankroll, client)
+        console.print(f"[dim]Live balance: ${bankroll:,.2f}[/dim]")
     market_lines = client.get_total_bases_lines(game_date, series_ticker=series_ticker)
     if not market_lines:
         _warn(f"No total bases markets found for date {game_date} (series={series_ticker}).")

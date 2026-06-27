@@ -459,6 +459,8 @@ def execute_signals(
                     client.cancel_order(o.order_id)
 
         result = client.place_order(sig.ticker, sig.recommended_side, sig.recommended_contracts, sig.limit_price)
+        if not result.success:
+            log.warning("Order FAILED %s %s %s@%.2f: %s", sig.ticker, sig.recommended_side, sig.recommended_contracts, sig.limit_price, result.message)
         ledger.add_attempt(
             key,
             price=sig.limit_price,

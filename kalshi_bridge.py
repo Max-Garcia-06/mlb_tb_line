@@ -305,17 +305,26 @@ class KalshiClient:
 
     def place_order(self, ticker: str, side: str, contracts: int, price: float, order_type: str = "limit") -> OrderResult:
         side_norm = (side or "").strip().lower()
-        body = {"ticker": ticker, "action": "buy", "side": side_norm, "count": contracts, "type": order_type}
+        # v2 API: bid = buy YES, ask = sell YES (= buy NO at 1 - price)
         if side_norm == "yes":
-            body["yes_price"] = int(round(price * 100))
+            book_side = "bid"
+            v2_price = f"{price:.4f}"
         elif side_norm == "no":
-            body["no_price"] = int(round(price * 100))
+            book_side = "ask"
+            v2_price = f"{round(1.0 - price, 4):.4f}"
         else:
             return OrderResult(False, "", ticker, side, contracts, price, f"Invalid side: {side!r}")
+        body = {
+            "ticker": ticker,
+            "side": book_side,
+            "count": str(contracts),
+            "price": v2_price,
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
+        }
         try:
-            data = self._post_order("/portfolio/orders", body)
-            order = data.get("order", {})
-            return OrderResult(True, order.get("order_id", ""), ticker, side_norm, contracts, price, "Order placed")
+            data = self._post_order("/portfolio/events/orders", body)
+            return OrderResult(True, data.get("order_id", ""), ticker, side_norm, contracts, price, "Order placed")
         except requests.HTTPError as e:
             return OrderResult(False, "", ticker, side_norm, contracts, price, str(e))
 
@@ -366,7 +375,7 @@ class KalshiClient:
 
     def cancel_order(self, order_id: str) -> bool:
         try:
-            self._delete(f"/portfolio/orders/{order_id}")
+            self._delete(f"/portfolio/events/orders/{order_id}")
             return True
         except requests.HTTPError:
             return False
