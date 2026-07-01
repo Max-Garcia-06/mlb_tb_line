@@ -75,8 +75,9 @@ case "$JOB" in
     run_py report --date "$YESTERDAY_ET"
     ;;
   nightly)
-    # ETL then settle yesterday's journal (report reconciles fills by default)
+    # ETL, reconcile yesterday's fills, then report against them
     run_py etl
+    run_py reconcile --date "$YESTERDAY_ET"
     run_py report --date "$YESTERDAY_ET"
     ;;
   scan)
