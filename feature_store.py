@@ -12,7 +12,15 @@ import numpy as np
 import pandas as pd
 import sqlalchemy as sa
 
-from config import DB_PATH, FEATURES_TABLE, ROLLING_WINDOW, MIN_GAMES
+from config import (
+    DB_PATH,
+    FEATURES_TABLE,
+    ROLLING_WINDOW,
+    MIN_GAMES,
+    STATCAST_BATTER_TABLE,
+    STATCAST_PITCHER_TABLE,
+    USE_STATCAST_FEATURES,
+)
 from venue_physics import lookup_park_physics
 from matchup_features import (
     MATCHUP_FEATURE_NAMES,
@@ -23,43 +31,126 @@ from matchup_features import (
 
 PITCHER_ROLLING_WINDOW = 5
 
-MODEL_FEATURES = [
-    "tb_roll",
-    "tb_season_avg",
-    "h_roll",
-    "ab_roll",
-    "hr_roll",
-    "bb_roll",
-    "so_roll",
-    "tb_per_ab_roll",
-    "h_per_ab_roll",
-    "hr_per_ab_roll",
-    "bb_per_ab_roll",
-    "so_per_ab_roll",
-    "tb_roll_std",
-    "days_since_last_game",
-    "game_month",
-    "game_dow",
-    # Statcast-style environment (venue priors + game-day weather; see data_engine ETL)
-    "venue_distance_added_index",
-    "venue_elevation_ft",
-    "game_temp_norm",
-    "game_wind_carry",
-    "statcast_env_lift",
-    # Opposing starter rolling stats (last 5 starts, shifted to avoid leakage)
-    "opp_sp_era_roll",
-    "opp_sp_k9_roll",
-    "opp_sp_hr9_roll",
-    "opp_sp_bb9_roll",
-] + MATCHUP_FEATURE_NAMES
+# Statcast batter quality-of-contact: per-game source columns -> shifted rolling feature.
+STATCAST_BATTER_ROLL = {
+    "xwoba": "xwoba_roll",
+    "xslg": "xslg_roll",
+    "avg_ev": "avg_ev_roll",
+    "barrel_rate": "barrel_rate_roll",
+    "hardhit_rate": "hardhit_rate_roll",
+}
+# Neutral league priors used to impute thin-sample rolling rows so they survive
+# the model's dropna (missing rolling Statcast => assume league-average contact).
+STATCAST_BATTER_NEUTRAL = {
+    "xwoba_roll": 0.360,
+    "xslg_roll": 0.430,
+    "avg_ev_roll": 89.0,
+    "barrel_rate_roll": 0.08,
+    "hardhit_rate_roll": 0.40,
+}
+
+# Statcast pitcher xStats-against: per-game source columns -> shifted rolling feature.
+STATCAST_PITCHER_ROLL = {
+    "xwoba_against": "opp_sp_xwoba_roll",
+    "barrel_rate_allowed": "opp_sp_barrel_allowed_roll",
+    "csw_pct": "opp_sp_csw_roll",
+}
+STATCAST_PITCHER_NEUTRAL = {
+    "opp_sp_xwoba_roll": 0.310,
+    "opp_sp_barrel_allowed_roll": 0.07,
+    "opp_sp_csw_roll": 0.28,
+}
+
+MODEL_FEATURES = (
+    [
+        "tb_roll",
+        "tb_season_avg",
+        "h_roll",
+        "ab_roll",
+        "hr_roll",
+        "bb_roll",
+        "so_roll",
+        "tb_per_ab_roll",
+        "h_per_ab_roll",
+        "hr_per_ab_roll",
+        "bb_per_ab_roll",
+        "so_per_ab_roll",
+        "tb_roll_std",
+        "days_since_last_game",
+        "game_month",
+        "game_dow",
+    ]
+    # Statcast batter quality of contact (opt-in; see USE_STATCAST_FEATURES)
+    + (list(STATCAST_BATTER_ROLL.values()) if USE_STATCAST_FEATURES else [])
+    + [
+        # Statcast-style environment (venue priors + game-day weather; see data_engine ETL)
+        "venue_distance_added_index",
+        "venue_elevation_ft",
+        "game_temp_norm",
+        "game_wind_carry",
+        "statcast_env_lift",
+        # Opposing starter rolling stats (last 5 starts, shifted to avoid leakage)
+        "opp_sp_era_roll",
+        "opp_sp_k9_roll",
+        "opp_sp_hr9_roll",
+        "opp_sp_bb9_roll",
+    ]
+    # Opposing starter Statcast xStats-against (opt-in; see USE_STATCAST_FEATURES)
+    + (list(STATCAST_PITCHER_ROLL.values()) if USE_STATCAST_FEATURES else [])
+    + MATCHUP_FEATURE_NAMES
+)
 
 
 def _engine():
     return sa.create_engine(f"sqlite:///{DB_PATH}")
 
 
+def _attach_statcast_batter(df: pd.DataFrame, engine: sa.Engine) -> pd.DataFrame:
+    """Left-join per-game Statcast batter metrics on (player_id, game_id)."""
+    src_cols = list(STATCAST_BATTER_ROLL.keys())
+    if "game_id" not in df.columns:
+        for c in src_cols:
+            df[c] = np.nan
+        return df
+    try:
+        sc = pd.read_sql(
+            f"SELECT player_id, game_id, {', '.join(src_cols)} FROM {STATCAST_BATTER_TABLE}",
+            engine,
+        )
+    except Exception:
+        for c in src_cols:
+            df[c] = np.nan
+        return df
+    if sc.empty:
+        for c in src_cols:
+            df[c] = np.nan
+        return df
+    sc["player_id"] = pd.to_numeric(sc["player_id"], errors="coerce").astype("Int64")
+    sc["game_id"] = pd.to_numeric(sc["game_id"], errors="coerce").astype("Int64")
+    df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce").astype("Int64")
+    df["game_id"] = pd.to_numeric(df["game_id"], errors="coerce").astype("Int64")
+    return df.merge(sc, on=["player_id", "game_id"], how="left")
+
+
+def _load_statcast_pitcher(engine: sa.Engine) -> pd.DataFrame:
+    """Per-game Statcast pitcher xStats-against keyed on (pitcher_id, game_id)."""
+    src_cols = list(STATCAST_PITCHER_ROLL.keys())
+    try:
+        sc = pd.read_sql(
+            f"SELECT player_id AS pitcher_id, game_id, {', '.join(src_cols)} FROM {STATCAST_PITCHER_TABLE}",
+            engine,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if sc.empty:
+        return pd.DataFrame()
+    sc["pitcher_id"] = pd.to_numeric(sc["pitcher_id"], errors="coerce").astype("Int64")
+    sc["game_id"] = pd.to_numeric(sc["game_id"], errors="coerce").astype("Int64")
+    return sc
+
+
 def _build_pitcher_rolling(engine: sa.Engine) -> pd.DataFrame:
-    """Build shifted rolling ERA/K9/BB9/HR9 for starters from pitcher_games table."""
+    """Build shifted rolling ERA/K9/BB9/HR9 + Statcast xStats-against for starters."""
     try:
         df = pd.read_sql("SELECT * FROM pitcher_games WHERE is_starter=1", engine)
     except Exception:
@@ -67,6 +158,14 @@ def _build_pitcher_rolling(engine: sa.Engine) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
     df["game_date"] = pd.to_datetime(df["game_date"])
+
+    if USE_STATCAST_FEATURES:
+        sc = _load_statcast_pitcher(engine)
+        if not sc.empty and "game_id" in df.columns:
+            df["pitcher_id"] = pd.to_numeric(df["pitcher_id"], errors="coerce").astype("Int64")
+            df["game_id"] = pd.to_numeric(df["game_id"], errors="coerce").astype("Int64")
+            df = df.merge(sc, on=["pitcher_id", "game_id"], how="left")
+
     df = df.sort_values(["pitcher_id", "game_date"]).reset_index(drop=True)
     g = df.groupby("pitcher_id", group_keys=False)
     for col in ("er", "so", "bb", "hr", "ip"):
@@ -82,7 +181,30 @@ def _build_pitcher_rolling(engine: sa.Engine) -> pd.DataFrame:
     df["opp_sp_k9_roll"]  = (df["so_roll"] / ip_safe * 9).clip(0, 20)
     df["opp_sp_bb9_roll"] = (df["bb_roll"] / ip_safe * 9).clip(0, 15)
     df["opp_sp_hr9_roll"] = (df["hr_roll"] / ip_safe * 9).clip(0, 10)
-    keep = ["team", "game_date", "opp_sp_era_roll", "opp_sp_k9_roll", "opp_sp_bb9_roll", "opp_sp_hr9_roll"]
+
+    df["game_id"] = pd.to_numeric(df["game_id"], errors="coerce").astype("int64")
+    keep = [
+        "game_id",
+        "team",
+        "game_date",
+        "opp_sp_era_roll",
+        "opp_sp_k9_roll",
+        "opp_sp_bb9_roll",
+        "opp_sp_hr9_roll",
+    ]
+    if USE_STATCAST_FEATURES:
+        for src_col, out_col in STATCAST_PITCHER_ROLL.items():
+            if src_col in df.columns:
+                s = g[src_col].shift(1)
+                df[out_col] = (
+                    s.groupby(df["pitcher_id"], group_keys=False)
+                    .rolling(PITCHER_ROLLING_WINDOW, min_periods=2)
+                    .mean()
+                    .reset_index(level=0, drop=True)
+                )
+            else:
+                df[out_col] = np.nan
+        keep = keep + list(STATCAST_PITCHER_ROLL.values())
     return df.dropna(subset=["opp_sp_era_roll"])[keep].copy()
 
 
@@ -120,6 +242,8 @@ def build_live_pitcher_features(game_date: str) -> dict[str, dict]:
         return {}
     all_starters["game_date"] = pd.to_datetime(all_starters["game_date"])
 
+    sc_pitch = _load_statcast_pitcher(engine)
+
     result: dict[str, dict] = {}
     for team_abbr, pitcher_id in probable.items():
         rows = all_starters[
@@ -134,12 +258,25 @@ def build_live_pitcher_features(game_date: str) -> dict[str, dict]:
         k9  = float((recent["so"].sum() / ip_total * 9).clip(0, 20))
         bb9 = float((recent["bb"].sum() / ip_total * 9).clip(0, 15))
         hr9 = float((recent["hr"].sum() / ip_total * 9).clip(0, 10))
-        result[team_abbr] = {
+        feats = {
             "opp_sp_era_roll": era,
             "opp_sp_k9_roll":  k9,
             "opp_sp_bb9_roll": bb9,
             "opp_sp_hr9_roll": hr9,
         }
+        if not sc_pitch.empty and "game_id" in recent.columns:
+            recent_ids = pd.to_numeric(recent["game_id"], errors="coerce").dropna().astype(int).tolist()
+            sc_recent = sc_pitch[
+                (sc_pitch["pitcher_id"] == int(pitcher_id))
+                & (sc_pitch["game_id"].isin(recent_ids))
+            ]
+            for src_col, out_col in STATCAST_PITCHER_ROLL.items():
+                val = pd.to_numeric(sc_recent.get(src_col), errors="coerce").mean() if not sc_recent.empty else None
+                feats[out_col] = float(val) if val is not None and pd.notna(val) else STATCAST_PITCHER_NEUTRAL[out_col]
+        else:
+            for out_col in STATCAST_PITCHER_ROLL.values():
+                feats[out_col] = STATCAST_PITCHER_NEUTRAL[out_col]
+        result[team_abbr] = feats
     return result
 
 
@@ -202,6 +339,9 @@ def build_feature_table(player_ids: Collection[int] | None = None) -> pd.DataFra
     df["game_date"] = pd.to_datetime(df["game_date"])
     df = df.sort_values(["player_id", "game_date"]).reset_index(drop=True)
     df = _ensure_env_columns(df)
+    if USE_STATCAST_FEATURES:
+        df = _attach_statcast_batter(df, engine)
+        df = df.sort_values(["player_id", "game_date"]).reset_index(drop=True)
 
     # Basic rollups
     g = df.groupby("player_id", group_keys=False)
@@ -229,6 +369,18 @@ def build_feature_table(player_ids: Collection[int] | None = None) -> pd.DataFra
     df["hr_per_ab_roll"] = (df["hr_roll"] / df["ab_roll"]).replace([float("inf"), -float("inf")], pd.NA)
     df["bb_per_ab_roll"] = (df["bb_roll"] / df["ab_roll"]).replace([float("inf"), -float("inf")], pd.NA)
     df["so_per_ab_roll"] = (df["so_roll"] / df["ab_roll"]).replace([float("inf"), -float("inf")], pd.NA)
+
+    # Statcast quality-of-contact rolling means (prior games only; impute thin samples).
+    if USE_STATCAST_FEATURES:
+        for src_col, out_col in STATCAST_BATTER_ROLL.items():
+            s = g[src_col].shift(1)
+            df[out_col] = (
+                s.groupby(df["player_id"], group_keys=False)
+                .rolling(ROLLING_WINDOW, min_periods=3)
+                .mean()
+                .reset_index(level=0, drop=True)
+            )
+            df[out_col] = df[out_col].fillna(STATCAST_BATTER_NEUTRAL[out_col])
 
     # Trailing volatility (using only prior games)
     tb_lag = g["tb"].shift(1)
@@ -260,14 +412,26 @@ def build_feature_table(player_ids: Collection[int] | None = None) -> pd.DataFra
     df = attach_platoon_features(df)
     df = finalize_matchup_columns(df)
 
-    # Join pitcher rolling stats keyed on (opponent_team, game_date)
+    # Join pitcher rolling stats keyed on (game_id, opponent_team) so each batter-game
+    # maps to exactly the opposing starter in that specific game (handles doubleheaders).
     pitcher_roll = _build_pitcher_rolling(engine)
     if not pitcher_roll.empty:
-        pitcher_roll = pitcher_roll.rename(columns={"team": "opponent_team"})
-        df = df.merge(pitcher_roll, on=["opponent_team", "game_date"], how="left")
+        pitcher_roll = pitcher_roll.rename(columns={"team": "opponent_team"}).drop(columns=["game_date"])
+        df["game_id"] = pd.to_numeric(df["game_id"], errors="coerce").astype("int64")
+        df = df.merge(pitcher_roll, on=["game_id", "opponent_team"], how="left")
     else:
         for c in ("opp_sp_era_roll", "opp_sp_k9_roll", "opp_sp_bb9_roll", "opp_sp_hr9_roll"):
             df[c] = np.nan
+        if USE_STATCAST_FEATURES:
+            for c in STATCAST_PITCHER_ROLL.values():
+                df[c] = np.nan
+
+    # Impute thin/missing Statcast pitcher rolls with neutral priors (don't gate dropna)
+    if USE_STATCAST_FEATURES:
+        for out_col, neutral in STATCAST_PITCHER_NEUTRAL.items():
+            if out_col not in df.columns:
+                df[out_col] = neutral
+            df[out_col] = pd.to_numeric(df[out_col], errors="coerce").fillna(neutral)
 
     # Filter for training cohort
     df = df[df["games_played"] >= MIN_GAMES].copy()

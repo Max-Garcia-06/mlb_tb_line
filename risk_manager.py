@@ -12,11 +12,14 @@ from typing import TYPE_CHECKING
 
 from config import (
     AUTO_KILL_ON_RISK_BREACH,
+    DAILY_LOSS_LIMIT_PCT,
     DAILY_LOSS_LIMIT_USD,
     KILL_SWITCH_PATH,
     MAX_CONTRACTS_PER_GAME,
+    MAX_DAILY_DEPLOYED_PCT,
     MAX_DAILY_DEPLOYED_USD,
     MAX_LEGS_PER_PLAYER_DAY,
+    MAX_OPEN_RESTING_PCT,
     MAX_OPEN_RESTING_USD,
     MAX_ORDERS_PER_DAY,
     RESERVE_RESTING_FROM_BANKROLL,
@@ -87,6 +90,13 @@ def effective_bankroll_from(balance: float, open_resting_usd: float) -> float:
     return float(balance)
 
 
+def _resolve_limit(abs_usd: float, pct: float, bankroll: float) -> float:
+    """Return effective USD limit. PCT takes priority when set; falls back to abs_usd. 0 = disabled."""
+    if pct > 0:
+        return pct * bankroll
+    return abs_usd
+
+
 def _maybe_auto_kill(reason: str) -> bool:
     if not AUTO_KILL_ON_RISK_BREACH:
         return False
@@ -101,6 +111,7 @@ def _check_limits(
     *,
     proposed_signals: list["EdgeSignal"] | None,
     n_new_orders: int,
+    bankroll: float = 0.0,
 ) -> str:
     """Return empty string if ok, else human-readable block reason."""
     merged = (
@@ -109,10 +120,11 @@ def _check_limits(
         else snapshot
     )
 
-    if DAILY_LOSS_LIMIT_USD > 0 and snapshot.total_pnl_for_limit <= -float(DAILY_LOSS_LIMIT_USD):
+    loss_limit = _resolve_limit(DAILY_LOSS_LIMIT_USD, DAILY_LOSS_LIMIT_PCT, bankroll)
+    if loss_limit > 0 and snapshot.total_pnl_for_limit <= -loss_limit:
         return (
             f"Daily loss limit hit (P&L ${snapshot.total_pnl_for_limit:.2f} "
-            f"<= -${DAILY_LOSS_LIMIT_USD:.2f}; realized ${snapshot.realized_pnl:.2f}, "
+            f"<= -${loss_limit:.2f}; realized ${snapshot.realized_pnl:.2f}, "
             f"mtm ${snapshot.mtm_pnl:.2f})"
         )
 
@@ -122,17 +134,19 @@ def _check_limits(
             return f"Max orders/day ({MAX_ORDERS_PER_DAY}) — already placed {placed}"
 
     if proposed_signals:
+        deploy_limit = _resolve_limit(MAX_DAILY_DEPLOYED_USD, MAX_DAILY_DEPLOYED_PCT, bankroll)
         prop_deploy = proposed_deployed_usd(proposed_signals)
-        if MAX_DAILY_DEPLOYED_USD > 0 and merged.deployed_usd > float(MAX_DAILY_DEPLOYED_USD):
+        if deploy_limit > 0 and merged.deployed_usd > deploy_limit:
             return (
-                f"Max daily deployed ${MAX_DAILY_DEPLOYED_USD:.2f} exceeded "
+                f"Max daily deployed ${deploy_limit:.2f} exceeded "
                 f"(would be ${merged.deployed_usd:.2f} incl. ${prop_deploy:.2f} proposed)"
             )
 
+        resting_limit = _resolve_limit(MAX_OPEN_RESTING_USD, MAX_OPEN_RESTING_PCT, bankroll)
         prop_rest = proposed_resting_usd(proposed_signals)
-        if MAX_OPEN_RESTING_USD > 0 and merged.open_resting_usd > float(MAX_OPEN_RESTING_USD):
+        if resting_limit > 0 and merged.open_resting_usd > resting_limit:
             return (
-                f"Max open resting ${MAX_OPEN_RESTING_USD:.2f} exceeded "
+                f"Max open resting ${resting_limit:.2f} exceeded "
                 f"(would be ${merged.open_resting_usd:.2f} incl. ${prop_rest:.2f} proposed)"
             )
 
@@ -183,6 +197,7 @@ def check_pre_trade_risk(
         snap,
         proposed_signals=proposed_signals,
         n_new_orders=n_new_orders,
+        bankroll=bankroll,
     )
     if reason:
         auto_killed = _maybe_auto_kill(reason)

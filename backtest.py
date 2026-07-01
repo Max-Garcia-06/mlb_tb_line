@@ -174,17 +174,26 @@ def _build_predictions(
     training_ids: set[int],
 ) -> list[dict]:
     from matchup_features import (
+        apply_live_feature_overrides,
         build_opp_tb_allowed_lookup,
         build_slate_matchup_index,
-        live_matchup_overrides,
-        merge_live_into_feature_dict,
         slate_teams,
     )
+    from feature_store import build_live_pitcher_features
+    from data_engine import get_confirmed_lineups
 
     feat_names = list(meta.get("feature_names") or MODEL_FEATURES)
     variance = meta["residual_var"]
     matchup_slate = build_slate_matchup_index(game_date)
     opp_tb_lookup = build_opp_tb_allowed_lookup(game_date, slate_teams(matchup_slate))
+    try:
+        live_sp_by_team = build_live_pitcher_features(game_date)
+    except Exception:
+        live_sp_by_team = {}
+    try:
+        confirmed_lineups = get_confirmed_lineups(game_date)
+    except Exception:
+        confirmed_lineups = {}
     by_slate: dict[tuple, list] = defaultdict(list)
     for ml in market_lines:
         by_slate[(norm_player_name(ml.player_name), str(ml.game_date))].append(ml)
@@ -215,16 +224,19 @@ def _build_predictions(
                     parts = str(ml0.ticker).split("-")
                     if len(parts) >= 2:
                         et = f"{parts[0]}-{parts[1]}"
-                overrides = live_matchup_overrides(
+                row_features = apply_live_feature_overrides(
+                    row_features,
                     game_date=game_date,
+                    player_id=int(latest.get("player_id", 0) or 0),
                     player_team=str(latest.get("team", "") or ""),
-                    event_ticker=et,
-                    tb_roll=float(latest.get("tb_roll", 0) or 0),
                     bats_hand=str(latest.get("bats_hand", "R") or "R"),
-                    slate=matchup_slate,
-                    opp_tb_allowed_by_team=opp_tb_lookup,
+                    tb_roll=float(latest.get("tb_roll", 0) or 0),
+                    event_ticker=et,
+                    matchup_slate=matchup_slate,
+                    opp_tb_lookup=opp_tb_lookup,
+                    confirmed_lineups=confirmed_lineups,
+                    live_sp_by_team=live_sp_by_team,
                 )
-                row_features = merge_live_into_feature_dict(row_features, overrides)
                 lam_raw = float(predict_lambda(row_features, trained_model, feature_names=feat_names, meta=meta))
                 gplayed = int(latest.get("games_played", 999) or 999)
                 if lam_raw > LAMBDA_SANITY_MAX and gplayed < GAMES_FOR_LAMBDA_SANITY:

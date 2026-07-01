@@ -16,6 +16,7 @@ configure_structured_logging(run_id=str(uuid.uuid4())[:8])
 app = typer.Typer(add_completion=False, help="MLB Total Bases Edge Pipeline")
 
 app.command()(cmd.etl)
+app.command("etl-statcast")(cmd.etl_statcast)
 app.command()(cmd.train)
 app.command()(cmd.evaluate)
 app.command()(cmd.tune)

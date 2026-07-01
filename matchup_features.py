@@ -59,7 +59,9 @@ def _player_bats_hand(player_id: int) -> str:
     """R, L, or S (switch)."""
     try:
         p = statsapi.get("person", {"personId": int(player_id)})
-        bat = ((p or {}).get("batSide") or {}).get("code", "") or ""
+        people = (p or {}).get("people") or []
+        person = people[0] if people else {}
+        bat = ((person or {}).get("batSide") or {}).get("code", "") or ""
         return str(bat).strip().upper()[:1] or "R"
     except Exception:
         return "R"
@@ -81,7 +83,9 @@ def _pitcher_hand_from_name(name: str) -> str:
         return "R"
     try:
         p = statsapi.get("person", {"personId": pid})
-        throw_code = ((p or {}).get("pitchHand") or {}).get("code", "") or ""
+        people = (p or {}).get("people") or []
+        person = people[0] if people else {}
+        throw_code = ((person or {}).get("pitchHand") or {}).get("code", "") or ""
         return str(throw_code).strip().upper()[:1] or "R"
     except Exception:
         return "R"
@@ -308,12 +312,15 @@ def live_matchup_overrides(
     bats_hand: str = "R",
     slate: dict[str, dict] | None = None,
     opp_tb_allowed_by_team: dict[str, float] | None = None,
+    lineup_slot: int | None = None,
 ) -> dict[str, float]:
     """
     Build matchup feature overrides for tonight's game (not from stale history row).
 
     Pass ``slate`` and ``opp_tb_allowed_by_team`` from scan/backtest to avoid repeated
-    MLB schedule and per-player SQL lookups.
+    MLB schedule and per-player SQL lookups. When ``lineup_slot`` (1-9) is supplied
+    from a confirmed lineup, it drives ``lineup_slot_norm`` / ``expected_pa_proxy``
+    instead of the neutral 0.55 default.
     """
     matchup = parse_kalshi_event_matchup(event_ticker) if event_ticker else None
     slate_idx = slate if slate is not None else build_slate_matchup_index(game_date)
@@ -343,11 +350,17 @@ def live_matchup_overrides(
                 opp_allowed = float(lookup.get(str(opp_team).upper(), 0.0))
     bats = str(bats_hand or "R").upper()[:1]
     boost = 1.08 if bats == "L" and opp_hand_L < 0.5 else (1.06 if bats == "R" and opp_hand_L > 0.5 else 1.0)
-    slot_norm = 0.55
+    if lineup_slot is not None and 1 <= int(lineup_slot) <= 9:
+        slot = float(int(lineup_slot))
+        slot_norm = slot / 9.0
+        expected_pa = float(min(5.2, max(3.2, 4.5 - 0.28 * (slot - 5.0))))
+    else:
+        slot_norm = 0.55
+        expected_pa = float(4.5 - 0.28 * (slot_norm * 9 - 5))
     return {
         "is_home": float(is_home),
         "lineup_slot_norm": float(slot_norm),
-        "expected_pa_proxy": float(4.5 - 0.28 * (slot_norm * 9 - 5)),
+        "expected_pa_proxy": float(expected_pa),
         "opp_tb_allowed_roll": float(opp_allowed),
         "opp_sp_hand_L": float(opp_hand_L),
         "platoon_tb_adj": float(tb_roll * boost),
@@ -360,3 +373,62 @@ def merge_live_into_feature_dict(base: dict, overrides: dict) -> dict:
         if k in overrides:
             out[k] = overrides[k]
     return out
+
+
+def opponent_team_for(event_ticker: str, player_team: str) -> str:
+    """Opposing team abbreviation for ``player_team`` given a Kalshi event ticker."""
+    matchup = parse_kalshi_event_matchup(event_ticker) if event_ticker else None
+    if not matchup:
+        return ""
+    away, home = matchup
+    team = str(player_team or "").upper()
+    if team == home:
+        return away
+    if team == away:
+        return home
+    return ""
+
+
+def apply_live_feature_overrides(
+    row_features: dict,
+    *,
+    game_date: str,
+    player_id: int,
+    player_team: str,
+    bats_hand: str,
+    tb_roll: float,
+    event_ticker: str,
+    matchup_slate: dict[str, dict] | None,
+    opp_tb_lookup: dict[str, float] | None = None,
+    confirmed_lineups: dict[int, int] | None = None,
+    live_sp_by_team: dict[str, dict] | None = None,
+) -> dict:
+    """
+    Replace a stale last-game feature row with tonight's matchup, confirmed lineup
+    slot, and the opposing probable starter's rolling stats. Shared by the live
+    scan and the backtest so both predict on identical inputs.
+    """
+    if not matchup_slate:
+        return row_features
+
+    lineup_slot = confirmed_lineups.get(int(player_id)) if confirmed_lineups else None
+    overrides = live_matchup_overrides(
+        game_date=str(game_date),
+        player_team=str(player_team or ""),
+        event_ticker=str(event_ticker or ""),
+        tb_roll=float(tb_roll or 0.0),
+        bats_hand=str(bats_hand or "R"),
+        slate=matchup_slate,
+        opp_tb_allowed_by_team=opp_tb_lookup,
+        lineup_slot=lineup_slot,
+    )
+    row_features = merge_live_into_feature_dict(row_features, overrides)
+
+    if live_sp_by_team:
+        opp_team = opponent_team_for(str(event_ticker or ""), str(player_team or ""))
+        sp = live_sp_by_team.get(opp_team) if opp_team else None
+        if sp:
+            for k, v in sp.items():
+                if k in row_features:
+                    row_features[k] = float(v)
+    return row_features

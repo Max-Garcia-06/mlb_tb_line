@@ -25,8 +25,10 @@ logs/
 
 # Local data (DB, journals, ledger — regenerate or keep private)
 data/*.db
+data/*.db.bak*
 data/*.jsonl
 data/execution_ledger.json
+data/statcast_cache/
 
 # Trained binaries and calibration artifacts (retrain with `python run_pipeline.py train`)
 models/*.pkl

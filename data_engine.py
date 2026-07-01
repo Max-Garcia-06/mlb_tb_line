@@ -414,8 +414,9 @@ def fetch_batter_rows_for_game(
     )
     if not isinstance(box, dict):
         raise TypeError(f"boxscore_data returned {type(box)!r}, expected dict")
-    away_abbr = str((box.get("away", {}).get("team", {}) or {}).get("abbreviation", "") or "").upper()
-    home_abbr = str((box.get("home", {}).get("team", {}) or {}).get("abbreviation", "") or "").upper()
+    team_info = box.get("teamInfo", {}) or {}
+    away_abbr = str((team_info.get("away", {}) or {}).get("abbreviation", "") or "").upper()
+    home_abbr = str((team_info.get("home", {}) or {}).get("abbreviation", "") or "").upper()
     if fetch_weather:
         env = fetch_game_environment(game_id)
         park_abbr = str(env.get("park_team_abbr") or home_abbr)
@@ -437,7 +438,7 @@ def fetch_batter_rows_for_game(
     for side in ("away", "home"):
         team = box.get(side, {}) or {}
         players = team.get("players", {}) or {}
-        team_abbr = (team.get("team", {}) or {}).get("abbreviation", "")
+        team_abbr = away_abbr if side == "away" else home_abbr
         for _, p in players.items():
             person = p.get("person", {}) or {}
             stats = (p.get("stats", {}) or {}).get("batting", {}) or {}
@@ -504,11 +505,12 @@ def fetch_pitcher_rows_for_game(game_id: int, game_date: str) -> list[dict]:
     )
     if not isinstance(box, dict):
         return []
+    team_info = box.get("teamInfo", {}) or {}
     rows: list[dict] = []
     for side in ("away", "home"):
         team_data = box.get(side, {}) or {}
         players = team_data.get("players", {}) or {}
-        team_abbr = str((team_data.get("team", {}) or {}).get("abbreviation", "") or "").upper()
+        team_abbr = str((team_info.get(side, {}) or {}).get("abbreviation", "") or "").upper()
         pitcher_ids: list[int] = team_data.get("pitchers", []) or []
         for rank, pid in enumerate(pitcher_ids):
             p = players.get(f"ID{pid}", {}) or {}
@@ -558,6 +560,33 @@ def get_probable_starters(game_date: str) -> dict[str, int]:
     except Exception as e:
         log.debug("get_probable_starters failed: %s", e)
         return {}
+
+
+def get_confirmed_lineups(game_date: str) -> dict[int, int]:
+    """
+    Return {player_id: batting_slot (1-9)} for confirmed lineups on ``game_date``.
+
+    Lineups typically post ~2-3h before first pitch. Returns empty when not yet set.
+    """
+    try:
+        data = statsapi.get(
+            "schedule",
+            {"date": game_date, "sportId": 1, "hydrate": "lineups"},
+        )
+    except Exception as e:
+        log.debug("get_confirmed_lineups failed: %s", e)
+        return {}
+    out: dict[int, int] = {}
+    for date_entry in (data.get("dates") or []):
+        for game in (date_entry.get("games") or []):
+            lineups = game.get("lineups") or {}
+            for side in ("homePlayers", "awayPlayers"):
+                players = lineups.get(side) or []
+                for slot, person in enumerate(players[:9], start=1):
+                    pid = int((person or {}).get("id", 0) or 0)
+                    if pid:
+                        out[pid] = slot
+    return out
 
 
 def _existing_pitcher_game_ids(engine: sa.Engine) -> set[int]:

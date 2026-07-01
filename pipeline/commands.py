@@ -18,6 +18,15 @@ from cli.output import console, _header, _success, _warn
 log = logging.getLogger(__name__)
 
 
+def _event_ticker_from_ml(ml0) -> str:
+    et = str(getattr(ml0, "event_ticker", "") or "")
+    if not et and getattr(ml0, "ticker", ""):
+        parts = str(ml0.ticker).split("-")
+        if len(parts) >= 2:
+            et = f"{parts[0]}-{parts[1]}"
+    return et
+
+
 def etl(seasons: str = typer.Option(None, "--seasons", help="Comma-separated seasons (years), e.g. '2023,2024'")):
     _header("Phase 1 — ETL: Pull MLB Batter Games")
     import data_engine as de
@@ -28,6 +37,24 @@ def etl(seasons: str = typer.Option(None, "--seasons", help="Comma-separated sea
     console.print(f"Database : {DB_PATH}\n")
     de.build_historical_store(season_list)
     _success("ETL complete.")
+
+
+def etl_statcast(
+    seasons: str = typer.Option(None, "--seasons", help="Comma-separated seasons (years), e.g. '2024,2025'"),
+    incremental: bool = typer.Option(False, "--incremental", help="Only pull dates after the latest stored game_date."),
+    chunk_days: int = typer.Option(None, "--chunk-days", help="Date-range chunk size for Savant pulls."),
+):
+    _header("Phase 1b — ETL: Statcast Quality of Contact")
+    import statcast_engine as se
+    from config import SEASONS, STATCAST_CHUNK_DAYS
+
+    season_list = [int(s.strip()) for s in seasons.split(",")] if seasons else SEASONS
+    chunk = int(chunk_days) if chunk_days else STATCAST_CHUNK_DAYS
+    console.print(f"Seasons    : {season_list}")
+    console.print(f"Incremental: {incremental}")
+    console.print(f"Chunk days : {chunk}\n")
+    counts = se.build_statcast_store(season_list, incremental=incremental, chunk_days=chunk)
+    _success(f"Statcast ETL complete: {counts['batter_rows']:,} batter-games, {counts['pitcher_rows']:,} pitcher-games.")
 
 
 def train():
@@ -227,6 +254,36 @@ def scan(
             if int(pid2 or 0) > 0:
                 slate_pid[key] = int(pid2)
 
+    from matchup_features import (
+        apply_live_feature_overrides,
+        build_opp_tb_allowed_lookup,
+        build_slate_matchup_index,
+        slate_teams,
+    )
+
+    try:
+        matchup_slate = build_slate_matchup_index(game_date)
+        opp_tb_lookup = build_opp_tb_allowed_lookup(game_date, slate_teams(matchup_slate))
+    except Exception as e:
+        _warn(f"Could not build tonight's matchup slate ({e}); falling back to stale row matchup features.")
+        matchup_slate, opp_tb_lookup = {}, {}
+
+    try:
+        from data_engine import get_confirmed_lineups
+
+        confirmed_lineups = get_confirmed_lineups(game_date)
+    except Exception as e:
+        log.debug("Confirmed lineups unavailable: %s", e)
+        confirmed_lineups = {}
+
+    try:
+        from feature_store import build_live_pitcher_features
+
+        live_sp_by_team = build_live_pitcher_features(game_date)
+    except Exception as e:
+        log.debug("Live probable-starter features unavailable: %s", e)
+        live_sp_by_team = {}
+
     slate_payload: dict[tuple, dict] = {}
     for key, mls in by_slate.items():
         xref = next((str(m.xref_player_id).strip() for m in mls if str(getattr(m, "xref_player_id", "") or "").strip()), None)
@@ -243,6 +300,19 @@ def scan(
             if not player_rows.empty:
                 latest = player_rows.sort_values("game_date").iloc[-1]
                 row_features = latest[feat_names].fillna(0).to_dict()
+                row_features = apply_live_feature_overrides(
+                    row_features,
+                    game_date=game_date,
+                    player_id=int(latest.get("player_id", 0) or 0),
+                    player_team=str(latest.get("team", "") or ""),
+                    bats_hand=str(latest.get("bats_hand", "R") or "R"),
+                    tb_roll=float(latest.get("tb_roll", 0) or 0),
+                    event_ticker=_event_ticker_from_ml(ml0),
+                    matchup_slate=matchup_slate,
+                    opp_tb_lookup=opp_tb_lookup,
+                    confirmed_lineups=confirmed_lineups,
+                    live_sp_by_team=live_sp_by_team,
+                )
                 lam_raw = float(predict_lambda(row_features, trained_model, feature_names=feat_names, meta=meta))
                 pmf_arr = predict_tb_pmf_row(row_features, trained_model, feature_names=feat_names, meta=meta)
                 gplayed = int(latest.get("games_played", 999) or 999)

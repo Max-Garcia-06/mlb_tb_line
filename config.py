@@ -69,6 +69,14 @@ DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "mlb_tb.db"))
 # Seasons (years) to pull
 SEASONS = [int(x) for x in os.getenv("SEASONS", "2022,2023,2024,2025,2026").split(",") if x.strip()]
 
+# Statcast (Baseball Savant via pybaseball): quality-of-contact tables + chunked pull cache
+STATCAST_BATTER_TABLE = os.getenv("STATCAST_BATTER_TABLE", "statcast_batter_games")
+STATCAST_PITCHER_TABLE = os.getenv("STATCAST_PITCHER_TABLE", "statcast_pitcher_games")
+STATCAST_CACHE_DIR = Path(os.getenv("STATCAST_CACHE_DIR", str(DATA_DIR / "statcast_cache")))
+STATCAST_CHUNK_DAYS = int(os.getenv("STATCAST_CHUNK_DAYS", "14"))
+# Minimum batted-ball events for a batter-game statcast row to be kept (drops 0-BBE noise rows)
+STATCAST_MIN_BBE = int(os.getenv("STATCAST_MIN_BBE", "1"))
+
 # MLB Stats API retries (ETL / schedule)
 MLB_API_MAX_RETRIES = int(os.getenv("MLB_API_MAX_RETRIES", "5"))
 MLB_API_RETRY_SLEEP_SEC = float(os.getenv("MLB_API_RETRY_SLEEP_SEC", "2.0"))
@@ -78,6 +86,12 @@ ROLLING_WINDOW = 15
 
 # Minimum games for a player to include in training
 MIN_GAMES = 20
+
+# Include Statcast quality-of-contact rolling features in MODEL_FEATURES.
+# Default off: on the current linear/GBM heads they did not improve walk-forward
+# Brier/log-loss (collinear with existing per-AB rate features). The ETL and
+# feature joins still run; flip this to experiment (e.g. with a richer model).
+USE_STATCAST_FEATURES = os.getenv("USE_STATCAST_FEATURES", "").lower() in ("1", "true", "yes")
 
 # Walk-forward CV controls (split by unique game_date)
 CV_GAP_DATES = int(os.getenv("CV_GAP_DATES", "1"))  # embargo gap between train and test folds (in unique dates)
@@ -116,9 +130,12 @@ REQUIRE_FILL_CALIB_FOR_LIVE = os.getenv("REQUIRE_FILL_CALIB_FOR_LIVE", "").lower
 # Live risk desk
 USE_LIVE_BALANCE = os.getenv("USE_LIVE_BALANCE", "true").lower() in ("1", "true", "yes")
 DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "0"))  # 0 = disabled
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0"))  # 0 = disabled; overrides _USD when set
 MAX_ORDERS_PER_DAY = int(os.getenv("MAX_ORDERS_PER_DAY", "0"))  # 0 = disabled
 MAX_DAILY_DEPLOYED_USD = float(os.getenv("MAX_DAILY_DEPLOYED_USD", "0"))  # 0 = disabled
+MAX_DAILY_DEPLOYED_PCT = float(os.getenv("MAX_DAILY_DEPLOYED_PCT", "0"))  # 0 = disabled; overrides _USD when set
 MAX_OPEN_RESTING_USD = float(os.getenv("MAX_OPEN_RESTING_USD", "0"))  # 0 = disabled
+MAX_OPEN_RESTING_PCT = float(os.getenv("MAX_OPEN_RESTING_PCT", "0"))  # 0 = disabled; overrides _USD when set
 MAX_CONTRACTS_PER_GAME = int(os.getenv("MAX_CONTRACTS_PER_GAME", "0"))  # 0 = disabled
 MAX_LEGS_PER_PLAYER_DAY = int(os.getenv("MAX_LEGS_PER_PLAYER_DAY", "0"))  # 0 = disabled
 RESERVE_RESTING_FROM_BANKROLL = os.getenv("RESERVE_RESTING_FROM_BANKROLL", "true").lower() in (
