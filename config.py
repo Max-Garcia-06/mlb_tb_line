@@ -47,6 +47,12 @@ MIN_P = float(os.getenv("MIN_P", "0.20"))
 TAIL_P_CUTOFF = float(os.getenv("TAIL_P_CUTOFF", "0.30"))
 TAIL_EDGE_MULT = float(os.getenv("TAIL_EDGE_MULT", "2.0"))
 
+# Kelly haircut for p_model bands with a history of poor calibration (win rate
+# trailing model probability). Multiplier applies only within [LOW, HIGH).
+RISKY_BAND_LOW = float(os.getenv("RISKY_BAND_LOW", "0.6"))
+RISKY_BAND_HIGH = float(os.getenv("RISKY_BAND_HIGH", "0.9"))
+RISKY_BAND_KELLY_MULT = float(os.getenv("RISKY_BAND_KELLY_MULT", "0.4"))
+
 # Execution guardrails
 MIN_LIMIT_PRICE = float(os.getenv("MIN_LIMIT_PRICE", "0.20"))  # avoid tiny-probability longshots by default
 MAX_YES_LINE = float(os.getenv("MAX_YES_LINE", "2.0"))  # e.g. avoid YES on 2.5+ if desired (set high to disable)

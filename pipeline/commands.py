@@ -1644,8 +1644,8 @@ def calibrate(
     Uses journal ``note=fill`` (run ``reconcile`` first) and Kalshi market ``result`` for outcomes.
     Writes ``models/p_calibrator_segmented.pkl`` and ``models/calibrator_meta.json``.
 
-    At live ``scan``, ``USE_OOF_CALIBRATION`` applies the OOF calibrator first when present;
-    this fill-based bundle is the fallback (see ``edge_detector._calibrate``).
+    At live ``scan``, this fill-based bundle is applied first when present;
+    the OOF calibrator is the fallback (see ``edge_detector._calibrate``).
     """
     import numpy as np
 
@@ -1749,8 +1749,7 @@ def calibrate(
     _success(
         f"Saved segmented fill calibrator ({n_seg} segment(s) with n>={MIN_CALIB_ROWS_SEGMENT}) "
         f"from {len(fit_rows)} resolved fills. "
-        "At scan, OOF calibrator is applied first when USE_OOF_CALIBRATION=true; "
-        "segmented fill calibrator is fallback."
+        "At scan, this fill calibrator is applied first; OOF calibrator is fallback."
     )
 
 

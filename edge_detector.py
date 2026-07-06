@@ -22,6 +22,9 @@ from config import (
     MIN_LIMIT_PRICE,
     MIN_REALISTIC_ASK,
     MAX_YES_LINE,
+    RISKY_BAND_LOW,
+    RISKY_BAND_HIGH,
+    RISKY_BAND_KELLY_MULT,
     TAIL_P_CUTOFF,
     TAIL_EDGE_MULT,
     USE_ISOTONIC_CALIBRATION,
@@ -89,16 +92,20 @@ def _calibrate(p: float, *, line: float = 1.5, side: str = "yes", games_played: 
     global _CALIBRATOR
     if not USE_ISOTONIC_CALIBRATION:
         return float(p)
-    oof = _get_oof_calibrator()
-    if oof is not None:
-        try:
-            return float(oof.transform(float(p)))
-        except Exception:
-            pass
+    # Live fill-based calibration is checked before OOF: OOF is fit on all
+    # historical games, but live trades are a filtered subset (only where
+    # edge clears threshold), so its calibration curve doesn't transfer to
+    # the subset actually traded. OOF remains the fallback for cold starts.
     seg = _get_segmented()
     if seg is not None:
         try:
             return float(seg.transform(float(p), line=line, side=side, games_played=games_played))
+        except Exception:
+            pass
+    oof = _get_oof_calibrator()
+    if oof is not None:
+        try:
+            return float(oof.transform(float(p)))
         except Exception:
             pass
     if _CALIBRATOR is None:
@@ -297,6 +304,8 @@ def detect_edge(
         return None
 
     kf = fractional_kelly(p, b)
+    if RISKY_BAND_LOW <= p < RISKY_BAND_HIGH:
+        kf *= RISKY_BAND_KELLY_MULT
     bet_dollars = min(kf * bankroll, MAX_BET_PCT * bankroll)
     contracts = dollars_to_contracts(bet_dollars, c)
     if contracts <= 0:
