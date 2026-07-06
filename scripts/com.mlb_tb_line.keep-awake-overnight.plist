@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mlb_tb_line.keep-awake-overnight</string>
+  <key>Comment</key>
+  <string>
+    launchd StartCalendarInterval has no timezone key (Hour/Minute are
+    always evaluated in the system's local time zone). This machine's
+    system clock is America/Los_Angeles, so times below are PDT, chosen
+    to bracket every cron job that needs the machine awake regardless
+    of AC/battery power:
+      22:50 PDT - bridge start (paired with the pmset repeat wake below)
+      23:00 PDT - mlb_tb_line nightly (etl/reconcile/report)
+      06:20 PDT - ca-jepa pre-market order submission (weekdays)
+      07:00 PDT - mlb_tb_line morning snapshot + first scan-live
+    9h assertion covers 22:50 PDT through 07:50 PDT with margin for a
+    slow-running job.
+  </string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>-t</string>
+    <string>32400</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>22</integer>
+    <key>Minute</key>
+    <integer>50</integer>
+  </dict>
+  <key>StandardErrorPath</key>
+  <string>@@REPO@@/logs/keep-awake-overnight.err</string>
+  <key>StandardOutPath</key>
+  <string>@@REPO@@/logs/keep-awake-overnight.out</string>
+</dict>
+</plist>
