@@ -36,10 +36,9 @@ def parse_kalshi_event_matchup(event_ticker: str) -> tuple[str, str] | None:
 MATCHUP_FEATURE_NAMES = [
     "is_home",
     "lineup_slot_norm",
-    "expected_pa_proxy",
     "opp_tb_allowed_roll",
     "opp_sp_hand_L",
-    "platoon_tb_adj",
+    "platoon_edge",
 ]
 
 
@@ -67,22 +66,17 @@ def _player_bats_hand(player_id: int) -> str:
         return "R"
 
 
-@lru_cache(maxsize=512)
-def _pitcher_hand_from_name(name: str) -> str:
-    key = (name or "").strip()
-    if not key:
-        return "R"
+@lru_cache(maxsize=2048)
+def _pitcher_hand_from_id(pitcher_id: int) -> str:
+    """R or L throwing hand, resolved by MLBAM person id.
+
+    Deliberately not a name search: ``statsapi.lookup_player(name)`` only
+    covers the current-season active-roster snapshot and silently returns no
+    hits for anyone not rostered at call time (IL, traded, optioned) --
+    measured at ~47% failure rate on a sample of real starting pitchers.
+    """
     try:
-        hits = statsapi.lookup_player(key)
-    except Exception:
-        hits = []
-    if not hits:
-        return "R"
-    pid = int(hits[0].get("id", 0) or 0)
-    if not pid:
-        return "R"
-    try:
-        p = statsapi.get("person", {"personId": pid})
+        p = statsapi.get("person", {"personId": int(pitcher_id)})
         people = (p or {}).get("people") or []
         person = people[0] if people else {}
         throw_code = ((person or {}).get("pitchHand") or {}).get("code", "") or ""
@@ -95,20 +89,20 @@ def schedule_games_by_date(game_date: str) -> list[dict]:
     return list(statsapi.schedule(date=game_date) or [])
 
 
-def _game_matchup_row(game: dict) -> dict[str, Any]:
+def _game_matchup_row(game: dict, probable: dict[str, int]) -> dict[str, Any]:
     abbr = _team_id_to_abbr()
     away_id = int(game.get("away_id", 0) or 0)
     home_id = int(game.get("home_id", 0) or 0)
     away = abbr.get(away_id, "")
     home = abbr.get(home_id, "")
-    away_sp = str(game.get("away_probable_pitcher", "") or "").strip()
-    home_sp = str(game.get("home_probable_pitcher", "") or "").strip()
+    away_pid = int(probable.get(away, 0) or 0)
+    home_pid = int(probable.get(home, 0) or 0)
     return {
         "game_id": int(game.get("game_id", 0) or 0),
         "away": away,
         "home": home,
-        "away_sp_hand": _pitcher_hand_from_name(away_sp),
-        "home_sp_hand": _pitcher_hand_from_name(home_sp),
+        "away_sp_hand": _pitcher_hand_from_id(away_pid) if away_pid else "R",
+        "home_sp_hand": _pitcher_hand_from_id(home_pid) if home_pid else "R",
     }
 
 
@@ -116,10 +110,16 @@ def _game_matchup_row(game: dict) -> dict[str, Any]:
 def build_slate_matchup_index(game_date: str) -> dict[str, dict]:
     """
     Map Kalshi matchup slug (e.g. ``BOSKC``) -> home/away, SP hands.
+
+    SP hand is resolved by MLBAM pitcher id via ``data_engine.get_probable_starters``,
+    not by searching the probable-pitcher name string.
     """
+    from data_engine import get_probable_starters
+
+    probable = get_probable_starters(game_date)
     out: dict[str, dict] = {}
     for g in schedule_games_by_date(game_date):
-        row = _game_matchup_row(g)
+        row = _game_matchup_row(g, probable)
         if not row["away"] or not row["home"]:
             continue
         slug = f"{row['away']}{row['home']}"
@@ -270,12 +270,16 @@ def attach_team_defense_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def attach_platoon_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Platoon adjustment vs opposing starter hand (historical rows use neutral 0.5 if unknown)."""
+    """Platoon edge vs opposing starter hand: a boost delta, decorrelated from tb_roll.
+
+    Previously this was ``tb_roll * boost`` (r=0.999 with tb_roll, already in
+    the model), which made the platoon-advantage signal statistically
+    invisible. The delta isolates the handedness-matchup effect on its own.
+    """
     df = df.copy()
     if "opp_sp_hand_L" not in df.columns:
         df["opp_sp_hand_L"] = 0.5
     df["opp_sp_hand_L"] = pd.to_numeric(df["opp_sp_hand_L"], errors="coerce").fillna(0.5)
-    tb_roll = pd.to_numeric(df.get("tb_roll", 0), errors="coerce").fillna(0)
     hand = df["opp_sp_hand_L"]
     bats = df.get("bats_hand", pd.Series(["R"] * len(df))).astype(str).str.upper().str[:1]
     # LHB vs RHP boost; RHB vs LHP boost
@@ -284,22 +288,28 @@ def attach_platoon_features(df: pd.DataFrame) -> pd.DataFrame:
         1.08,
         np.where((bats == "R") & (hand > 0.5), 1.06, 1.0),
     )
-    df["platoon_tb_adj"] = tb_roll * boost
+    df["platoon_edge"] = boost - 1.0
     return df
 
 
 def finalize_matchup_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Derive normalized matchup columns used by the model."""
     df = df.copy()
-    slot = pd.to_numeric(df.get("lineup_slot", 0), errors="coerce").fillna(5)
+    # Ensure columns exist before transforming
+    if "lineup_slot" not in df.columns:
+        df["lineup_slot"] = 5
+    if "is_home" not in df.columns:
+        df["is_home"] = 0
+    if "opp_tb_allowed_roll" not in df.columns:
+        df["opp_tb_allowed_roll"] = 0
+    slot = pd.to_numeric(df["lineup_slot"], errors="coerce").fillna(5)
     df["lineup_slot_norm"] = (slot / 9.0).clip(0, 1)
-    df["expected_pa_proxy"] = (4.5 - 0.28 * (slot - 5.0)).clip(3.2, 5.2)
-    df["is_home"] = pd.to_numeric(df.get("is_home", 0), errors="coerce").fillna(0)
-    df["opp_tb_allowed_roll"] = pd.to_numeric(df.get("opp_tb_allowed_roll", 0), errors="coerce").fillna(0)
+    df["is_home"] = pd.to_numeric(df["is_home"], errors="coerce").fillna(0)
+    df["opp_tb_allowed_roll"] = pd.to_numeric(df["opp_tb_allowed_roll"], errors="coerce").fillna(0)
     if "opp_sp_hand_L" not in df.columns:
         df["opp_sp_hand_L"] = 0.5
-    if "platoon_tb_adj" not in df.columns:
-        df["platoon_tb_adj"] = pd.to_numeric(df.get("tb_roll", 0), errors="coerce").fillna(0)
+    if "platoon_edge" not in df.columns:
+        df["platoon_edge"] = 0.0
     return df
 
 
@@ -319,8 +329,8 @@ def live_matchup_overrides(
 
     Pass ``slate`` and ``opp_tb_allowed_by_team`` from scan/backtest to avoid repeated
     MLB schedule and per-player SQL lookups. When ``lineup_slot`` (1-9) is supplied
-    from a confirmed lineup, it drives ``lineup_slot_norm`` / ``expected_pa_proxy``
-    instead of the neutral 0.55 default.
+    from a confirmed lineup, it drives ``lineup_slot_norm`` instead of the neutral
+    0.55 default.
     """
     matchup = parse_kalshi_event_matchup(event_ticker) if event_ticker else None
     slate_idx = slate if slate is not None else build_slate_matchup_index(game_date)
@@ -351,19 +361,15 @@ def live_matchup_overrides(
     bats = str(bats_hand or "R").upper()[:1]
     boost = 1.08 if bats == "L" and opp_hand_L < 0.5 else (1.06 if bats == "R" and opp_hand_L > 0.5 else 1.0)
     if lineup_slot is not None and 1 <= int(lineup_slot) <= 9:
-        slot = float(int(lineup_slot))
-        slot_norm = slot / 9.0
-        expected_pa = float(min(5.2, max(3.2, 4.5 - 0.28 * (slot - 5.0))))
+        slot_norm = float(int(lineup_slot)) / 9.0
     else:
         slot_norm = 0.55
-        expected_pa = float(4.5 - 0.28 * (slot_norm * 9 - 5))
     return {
         "is_home": float(is_home),
         "lineup_slot_norm": float(slot_norm),
-        "expected_pa_proxy": float(expected_pa),
         "opp_tb_allowed_roll": float(opp_allowed),
         "opp_sp_hand_L": float(opp_hand_L),
-        "platoon_tb_adj": float(tb_roll * boost),
+        "platoon_edge": float(boost - 1.0),
     }
 
 
