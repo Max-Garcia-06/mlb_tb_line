@@ -569,7 +569,7 @@ def tune_hyperparameters(
         feature_subsets = [list(MODEL_FEATURES)]
         # Lightweight ordinal feature ablation trials
         base_matchup = [f for f in MODEL_FEATURES if f in (
-            "is_home", "lineup_slot_norm", "expected_pa_proxy", "opp_tb_allowed_roll", "opp_sp_hand_L", "platoon_tb_adj"
+            "is_home", "lineup_slot_norm", "opp_tb_allowed_roll", "opp_sp_hand_L", "platoon_edge"
         )]
         if base_matchup:
             feature_subsets.append([f for f in MODEL_FEATURES if f not in base_matchup])
