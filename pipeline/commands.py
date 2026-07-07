@@ -127,16 +127,18 @@ def scan(
     series_ticker: str = typer.Option("KXMLBTB", "--series-ticker", help="Kalshi series ticker for MLB total bases markets."),
     dry_run: bool = typer.Option(True, "--dry-run/--live"),
     auto_mark: bool = typer.Option(True, "--auto-mark/--no-auto-mark", help="Automatically record CLV marks after scan (live mode only)."),
-    mark_delays: str = typer.Option("30,120", "--mark-delays", help="Comma-separated minutes after scan to record marks, e.g. '30,120'."),
+    mark_delays: str = typer.Option("15,30,60,90", "--mark-delays", help="Comma-separated minutes after scan to record marks, e.g. '15,30,60,90'."),
 ):
     from config import (
         BASE_DIR,
         EDGE_THRESHOLD,
         GAMES_FOR_LAMBDA_SANITY,
         LAMBDA_SANITY_MAX,
+        MAKER_MODE,
         MAX_YES_LINE,
         MIN_LIMIT_PRICE,
         MIN_P,
+        SCAN_WITHIN_HOURS,
         TAIL_P_CUTOFF,
         TAIL_EDGE_MULT,
     )
@@ -150,10 +152,13 @@ def scan(
         execute_signals,
         expected_pnl_usd,
         expected_pnl_usd_std,
+        is_blocked_segment,
         portfolio_expected_pnl_std,
         fill_calibrated_probabilities,
+        quote_side_edge,
         scan_for_edges,
     )
+    from market_blend import load_blend_weight
     from kalshi_bridge import MockKalshiClient, attach_vpin_proxy_batch, get_client
     from capital_optimizer import resize_signals_portfolio
     from identity_bridge import norm_player_name, resolve_mlb_player_id
@@ -203,6 +208,21 @@ def scan(
     if not market_lines:
         _warn("No pre-game total bases markets left after excluding started games.")
         raise typer.Exit(0)
+
+    if SCAN_WITHIN_HOURS > 0:
+        from data_engine import filter_market_lines_by_start_window
+
+        market_lines, excluded_window = filter_market_lines_by_start_window(
+            market_lines, game_date, within_hours=SCAN_WITHIN_HOURS
+        )
+        if excluded_window:
+            console.print(
+                f"[dim]Entry window: excluded {len(excluded_window)} game(s) not starting within "
+                f"{SCAN_WITHIN_HOURS:g}h; {len(market_lines)} market(s) remain.[/dim]\n"
+            )
+        if not market_lines:
+            _warn(f"No markets starting within {SCAN_WITHIN_HOURS:g}h (SCAN_WITHIN_HOURS).")
+            raise typer.Exit(0)
 
     console.print(f"Found {len(market_lines)} total bases markets on Kalshi (pre-game only)\n")
 
@@ -368,20 +388,25 @@ def scan(
         side: str,
         kalshi_line: float,
     ) -> str:
-        """Color edge vs ask using the same pre-EV gates as detect_edge (spread/ask/min_p/threshold; not EV)."""
+        """Color fee-adjusted blended edge using the same pre-EV gates as detect_edge (not EV)."""
         need = _edge_thr_for_p(p_side)
         spread_ok = spread <= MAX_BID_ASK_SPREAD
         ask_ok = ask >= MIN_LIMIT_PRICE
         line_ok = float(kalshi_line) <= float(MAX_YES_LINE) if side == "yes" else True
+        seg_ok = not is_blocked_segment(kalshi_line, side)
         min_ok = p_side >= min_p_eff
-        edge_ok = e > need and spread_ok and ask_ok and line_ok
+        edge_ok = e > need and spread_ok and ask_ok and line_ok and seg_ok
         color = "green" if edge_ok and min_ok else ("yellow" if e > 0 else "red")
         return f"[{color}]{e:+.3f}[/{color}]"
 
     console.print(
-        "[dim]Legend: Pr/Pc/Pu = P(over) raw / cal P(over) / 1−Pc; eY/eN = cal edge vs YES ask / NO ask "
-        f"(same as signals; max spread {MAX_BID_ASK_SPREAD:.2f}); Ymid = YES mid only. "
-        "Green eY/eN = passes min_p + edge vs threshold + spread + ask (+ YES line cap for eY), not EV.[/dim]\n"
+        f"[dim]Blend w={load_blend_weight():.2f} (p = w·model + (1−w)·market mid, logit space) · "
+        f"maker mode {'ON' if MAKER_MODE else 'OFF'} · edges net of Kalshi fee at limit.[/dim]"
+    )
+    console.print(
+        "[dim]Legend: Pr/Pc/Pb = P(over) raw / calibrated / blended-with-market; "
+        f"eY/eN = blended edge net of fee vs suggested limit (same as signals; max spread {MAX_BID_ASK_SPREAD:.2f}). "
+        "Green eY/eN = passes min_p + edge vs threshold + spread + ask + segment gates, not EV.[/dim]\n"
     )
     t = Table(title=f"TB vs Kalshi — {game_date}", box=box.SIMPLE_HEAD)
     t.add_column("Player", style="cyan", min_width=14, overflow="ellipsis")
@@ -389,7 +414,7 @@ def scan(
     t.add_column("lam", justify="right", min_width=4)
     t.add_column("Pr", justify="right", min_width=5)
     t.add_column("Pc", justify="right", min_width=5)
-    t.add_column("Pu", justify="right", min_width=5)
+    t.add_column("Pb", justify="right", min_width=5)
     t.add_column("Y\nmid", justify="right", min_width=5)
     t.add_column("Y\nask", justify="right", min_width=5)
     t.add_column("eY", justify="right", min_width=6)
@@ -402,13 +427,13 @@ def scan(
         p_or = float(pr.p_over)
         p_oc = float(pr.p_over_calibrated) if pr.p_over_calibrated is not None else p_or
         p_uc = float(pr.p_under_calibrated) if pr.p_under_calibrated is not None else (1.0 - p_or)
-        yes_edge = p_oc - float(ml.yes_ask)
-        no_edge = p_uc - float(ml.no_ask)
+        p_ob, _, _, yes_edge = quote_side_edge(p_oc, bid=float(ml.yes_bid), ask=float(ml.yes_ask), side="yes")
+        p_ub, _, _, no_edge = quote_side_edge(p_uc, bid=float(ml.no_bid), ask=float(ml.no_ask), side="no")
         eY_cell = _fmt_edge_cell(
-            yes_edge, p_oc, float(ml.yes_ask), float(ml.yes_spread), side="yes", kalshi_line=float(ml.line)
+            yes_edge, p_ob, float(ml.yes_ask), float(ml.yes_spread), side="yes", kalshi_line=float(ml.line)
         )
         eN_cell = _fmt_edge_cell(
-            no_edge, p_uc, float(ml.no_ask), float(ml.no_spread), side="no", kalshi_line=float(ml.line)
+            no_edge, p_ub, float(ml.no_ask), float(ml.no_spread), side="no", kalshi_line=float(ml.line)
         )
         t.add_row(
             pr.player_name,
@@ -416,7 +441,7 @@ def scan(
             f"{pr.predicted_lambda:.2f}",
             f"{p_or:.3f}",
             f"{p_oc:.3f}",
-            f"{p_uc:.3f}",
+            f"{p_ob:.3f}",
             f"{ml.implied_prob:.3f}",
             f"{ml.yes_ask:.2f}",
             eY_cell,
@@ -642,7 +667,7 @@ def report(game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM
         placed_post_submit,
     )
     from kalshi_bridge import get_client
-    from reporting_common import edge_bucket, market_yes_no_result, pnl_per_contract, price_bucket, spread_bucket
+    from reporting_common import edge_bucket, estimated_order_fee_usd, market_yes_no_result, pnl_per_contract, price_bucket, spread_bucket
     from trade_journal import journal_path
 
     game_date = game_date or datetime.today().strftime("%Y-%m-%d")
@@ -678,6 +703,7 @@ def report(game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM
 
     total_cost = 0.0
     total_realized = 0.0
+    total_fees = 0.0
     total_expected = 0.0
     total_expected_resolved = 0.0
     unresolved = 0
@@ -723,6 +749,7 @@ def report(game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM
             continue
         pnl = pnlpc * filled_contracts
         total_realized += pnl
+        total_fees += estimated_order_fee_usd(fill or r, price, filled_contracts)
         total_expected_resolved += float(edge) * filled_contracts
         resolved_n += 1
         is_win = side == res
@@ -805,6 +832,11 @@ def report(game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM
     if total_cost > 0 and (len(placed) - unresolved) > 0:
         roi = (total_realized / total_cost) * 100
         console.print(f"Realized P&L (resolved)   : ${total_realized:,.2f}  (ROI {roi:.2f}%)")
+        net = total_realized - total_fees
+        net_roi = (net / total_cost) * 100
+        console.print(
+            f"Kalshi fees (est)         : ${total_fees:,.2f}  →  Net P&L after fees: ${net:,.2f}  (ROI {net_roi:.2f}%)"
+        )
         if abs(total_expected_resolved) > 1e-9:
             ratio = total_realized / total_expected_resolved
             console.print(f"Realized / Expected (res) : {ratio:.2f}×")
@@ -1090,7 +1122,7 @@ def report_range(
         parse_iso_date,
     )
     from kalshi_bridge import get_client
-    from reporting_common import edge_bucket, market_yes_no_result, pnl_per_contract, price_bucket, spread_bucket
+    from reporting_common import edge_bucket, estimated_order_fee_usd, market_yes_no_result, pnl_per_contract, price_bucket, spread_bucket
 
     journal_paths = journal_paths_sorted()
     if not journal_paths:
@@ -1148,6 +1180,7 @@ def report_range(
 
     total_cost = 0.0
     total_realized = 0.0
+    total_fees = 0.0
     total_expected = 0.0
     total_expected_resolved = 0.0
     unresolved = 0
@@ -1198,6 +1231,7 @@ def report_range(
 
         pnl = pnlpc * filled_contracts
         total_realized += pnl
+        total_fees += estimated_order_fee_usd(fill or r, price, filled_contracts)
         total_expected_resolved += float(edge) * filled_contracts
         by_day[day]["pnl"] += pnl
         resolved_n += 1
@@ -1282,6 +1316,11 @@ def report_range(
     if total_cost > 0 and (len(placed) - unresolved) > 0:
         roi = (total_realized / total_cost) * 100
         console.print(f"Realized P&L (resolved)   : ${total_realized:,.2f}  (ROI {roi:.2f}%)")
+        net = total_realized - total_fees
+        net_roi = (net / total_cost) * 100
+        console.print(
+            f"Kalshi fees (est)         : ${total_fees:,.2f}  →  Net P&L after fees: ${net:,.2f}  (ROI {net_roi:.2f}%)"
+        )
         if abs(total_expected_resolved) > 1e-9:
             ratio = total_realized / total_expected_resolved
             console.print(f"Realized / Expected (res) : {ratio:.2f}×")
@@ -1751,6 +1790,99 @@ def calibrate(
         f"from {len(fit_rows)} resolved fills. "
         "At scan, this fill calibrator is applied first; OOF calibrator is fallback."
     )
+
+
+def fit_blend(
+    start: str = typer.Option(None, "--start", help="Start date YYYY-MM-DD (inclusive). Default: earliest journal found."),
+    end: str = typer.Option(None, "--end", help="End date YYYY-MM-DD (inclusive). Default: latest journal found."),
+    min_rows: int = typer.Option(None, "--min-rows", help="Minimum resolved fills to fit (default: MIN_BLEND_ROWS)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Fit and report, but do not write models/blend_meta.json."),
+):
+    """
+    Fit the market-blend weight ``w`` on resolved reconciled fills.
+
+    Minimizes contract-weighted log-loss of
+    ``sigmoid(w*logit(p_model) + (1-w)*logit(market_mid))`` over the traded
+    side's outcome. Uses ``p_model_cal`` (pre-blend) when journaled so re-fits
+    never double-shrink; older rows fall back to ``p_model``.
+    Writes ``models/blend_meta.json``, which ``scan`` picks up automatically.
+    """
+    from config import DATA_DIR, MIN_BLEND_ROWS
+    from journal_reader import date_from_journal_filename, journal_paths_sorted, load_jsonl_rows, parse_iso_date
+    from kalshi_bridge import get_client
+    from market_blend import fit_blend_weight, save_blend_meta
+    from reporting_common import market_yes_no_result
+
+    journal_paths = journal_paths_sorted()
+    if not journal_paths:
+        _warn(f"No trade journals found under {DATA_DIR}")
+        raise typer.Exit(0)
+    dates = sorted({d for p in journal_paths if (d := date_from_journal_filename(p))})
+    start_d = parse_iso_date(start) if start else parse_iso_date(dates[0])
+    end_d = parse_iso_date(end) if end else parse_iso_date(dates[-1])
+    if end_d < start_d:
+        _warn("--end must be >= --start")
+        raise typer.Exit(2)
+
+    _header(f"Fit market-blend weight — {start_d.strftime('%Y-%m-%d')} → {end_d.strftime('%Y-%m-%d')}")
+
+    fill_rows: list[dict] = []
+    for p in journal_paths:
+        d = date_from_journal_filename(p)
+        if not d:
+            continue
+        try:
+            dd = parse_iso_date(d)
+        except Exception:
+            continue
+        if dd < start_d or dd > end_d:
+            continue
+        for r in load_jsonl_rows(p):
+            if r.get("note") == "fill" and r.get("order_id") and int(r.get("filled_contracts", 0) or 0) > 0:
+                fill_rows.append(r)
+    if not fill_rows:
+        _warn("No fill rows found. Run reconcile first.")
+        raise typer.Exit(0)
+
+    client = get_client()
+    by_ticker: dict[str, dict] = {}
+    for r in fill_rows:
+        t = str(r.get("ticker", ""))
+        if t and t not in by_ticker:
+            try:
+                by_ticker[t] = client.get_market(t)
+            except Exception:
+                by_ticker[t] = {}
+
+    rows: list[dict] = []
+    for r in fill_rows:
+        res = market_yes_no_result(by_ticker.get(str(r.get("ticker", "")), {}))
+        if res not in {"yes", "no"}:
+            continue
+        side = str(r.get("side", "")).lower()
+        p_cal = float(r.get("p_model_cal", 0.0) or 0.0)
+        p = p_cal if p_cal > 0 else float(r.get("p_model", 0.0))
+        bid, ask = float(r.get("book_bid", 0.0)), float(r.get("book_ask", 0.0))
+        if not (0.0 < p < 1.0) or ask <= 0:
+            continue
+        mid = (bid + ask) / 2.0 if bid > 0 else ask
+        rows.append({"p": p, "m": mid, "y": 1.0 if side == res else 0.0, "weight": float(r.get("filled_contracts", 1))})
+
+    min_needed = int(min_rows) if min_rows is not None else int(MIN_BLEND_ROWS)
+    if len(rows) < min_needed:
+        _warn(f"Not enough resolved fills to fit blend ({len(rows)}<{min_needed}). Pass --min-rows to override.")
+        raise typer.Exit(0)
+
+    w, diag = fit_blend_weight(rows)
+    console.print(f"Resolved fills          : {diag['n_rows']}")
+    console.print(f"Log-loss market only    : {diag['logloss_market_only']:.4f}  (w=0)")
+    console.print(f"Log-loss model only     : {diag['logloss_model_only']:.4f}  (w=1)")
+    console.print(f"Log-loss best blend     : {diag['logloss_best']:.4f}  (w={w:.2f})")
+    if dry_run:
+        _warn("Dry run — blend_meta.json not written.")
+        raise typer.Exit(0)
+    save_blend_meta(w, diag, start=start_d.strftime("%Y-%m-%d"), end=end_d.strftime("%Y-%m-%d"))
+    _success(f"Saved blend weight w={w:.2f} to models/blend_meta.json (scan applies it automatically).")
 
 
 def segment_report(

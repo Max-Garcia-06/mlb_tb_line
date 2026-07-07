@@ -12,9 +12,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 from config import (
+    BLOCKED_SEGMENTS,
     EDGE_THRESHOLD,
     ENABLE_VPIN_GUARD,
     KELLY_FRACTION,
+    MAKER_MODE,
     MAX_BET_PCT,
     MAX_REALISTIC_ASK,
     MIN_EV,
@@ -32,6 +34,8 @@ from config import (
     USE_SEGMENTED_CALIBRATION,
     VPIN_MAX_TOXIC,
 )
+from fees import fee_per_contract
+from market_blend import blend_probability, load_blend_weight
 from probability_engine import ProbabilityResult
 from kalshi_bridge import MarketLine, OrderResult, get_client
 from execution_engine import ExecutionLedger, LedgerKey, suggest_limit_price
@@ -174,34 +178,68 @@ class EdgeSignal:
     book_ask: float
     book_spread: float
     games_played: int = 0
+    fee_per_contract: float = 0.0
+    p_model_cal: float = 0.0  # calibrated, pre-blend side prob (input for fit-blend)
 
 
-def expected_pnl_per_contract_mean_var(p: float, limit_price: float) -> tuple[float, float]:
+def is_blocked_segment(line: float, side: str) -> bool:
+    """True when (line, side) is disabled via BLOCKED_SEGMENTS (e.g. '1.5:no')."""
+    return (f"{float(line):g}", str(side).lower()) in BLOCKED_SEGMENTS
+
+
+def quote_side_edge(
+    p_side_cal: float,
+    *,
+    bid: float,
+    ask: float,
+    side: str,
+) -> tuple[float, float, float, float]:
+    """
+    Blend the calibrated side prob toward the side's market mid, pick the limit
+    price, and return the fee-adjusted edge vs that limit.
+
+    Returns ``(p_blend, limit_price, fee_per_contract, edge)``.
+    """
+    bid, ask = float(bid), float(ask)
+    # Empty book side ⇒ mid = ask/2 is noise; shrink toward the ask instead (conservative).
+    mid = (bid + ask) / 2.0 if bid > 0 else ask
+    p_blend = blend_probability(float(p_side_cal), mid, load_blend_weight())
+    limit = suggest_limit_price(side=side, bid=bid, ask=ask, model_fair=p_blend, maker=MAKER_MODE)
+    is_taker = limit >= ask - 1e-9
+    fee = fee_per_contract(limit, is_taker=is_taker)
+    edge = p_blend - limit - fee
+    return p_blend, limit, fee, edge
+
+
+def expected_pnl_per_contract_mean_var(p: float, limit_price: float, fee: float = 0.0) -> tuple[float, float]:
     """
     Mean and variance of profit (USD) for one long contract at limit L, win prob p.
 
-    Win payoff (1-L), lose payoff (-L); Var from Bernoulli two-point distribution.
+    Win payoff (1-L-fee), lose payoff (-L-fee); the fee is a constant shift so
+    the variance is unchanged from the fee-free Bernoulli two-point distribution.
     """
     p = float(min(1.0 - 1e-9, max(1e-9, p)))
     L = float(min(0.9999, max(1e-6, limit_price)))
     win = 1.0 - L
     lose = -L
-    mean = p * win + (1.0 - p) * lose
+    mean_gross = p * win + (1.0 - p) * lose
     ex2 = p * win * win + (1.0 - p) * lose * lose
-    var = max(0.0, ex2 - mean * mean)
-    return mean, var
+    var = max(0.0, ex2 - mean_gross * mean_gross)
+    return mean_gross - float(fee), var
 
 
 def expected_pnl_usd(signal: EdgeSignal) -> float:
     """
     Expected profit in USD for the sized position: long N binary contracts at limit_price.
 
-    Per contract E[profit] = p*(1-L) - (1-p)*L = p - L with p = P(win) for the chosen side.
+    Per contract E[profit] = p*(1-L) - (1-p)*L - fee = p - L - fee with p = P(win) for the chosen side.
     """
     n = int(signal.recommended_contracts)
     if n <= 0:
         return 0.0
-    mu, _ = expected_pnl_per_contract_mean_var(float(signal.p_model), float(signal.limit_price))
+    mu, _ = expected_pnl_per_contract_mean_var(
+        float(signal.p_model), float(signal.limit_price), float(signal.fee_per_contract)
+    )
     return float(n) * mu
 
 
@@ -268,37 +306,50 @@ def detect_edge(
             prob_result.p_over, line=float(prob_result.kalshi_line), games_played=gp
         )
 
+    # Blend toward the side's market mid, pick a limit, and measure the edge
+    # net of the expected Kalshi fee at that limit (taker fee if it crosses).
     if not (MIN_REALISTIC_ASK <= float(market_line.yes_ask) <= MAX_REALISTIC_ASK):
-        yes_edge = -1.0
+        p_over_b, yes_limit, yes_fee, yes_edge = p_over, float(market_line.yes_ask), 0.0, -1.0
     else:
-        yes_edge = p_over - market_line.yes_ask
+        p_over_b, yes_limit, yes_fee, yes_edge = quote_side_edge(
+            p_over, bid=market_line.yes_bid, ask=market_line.yes_ask, side="yes"
+        )
     if not (MIN_REALISTIC_ASK <= float(market_line.no_ask) <= MAX_REALISTIC_ASK):
-        no_edge = -1.0
+        p_under_b, no_limit, no_fee, no_edge = p_under, float(market_line.no_ask), 0.0, -1.0
     else:
-        no_edge = p_under - market_line.no_ask
+        p_under_b, no_limit, no_fee, no_edge = quote_side_edge(
+            p_under, bid=market_line.no_bid, ask=market_line.no_ask, side="no"
+        )
 
     def _thr(p: float) -> float:
         return edge_threshold * (tail_edge_mult if p < tail_p_cutoff else 1.0)
 
     best = None
     if (
-        p_over >= min_p
-        and yes_edge > _thr(p_over)
+        p_over_b >= min_p
+        and yes_edge > _thr(p_over_b)
         and market_line.yes_spread <= max_spread
         and market_line.yes_ask >= MIN_LIMIT_PRICE
         and market_line.line <= MAX_YES_LINE
+        and not is_blocked_segment(market_line.line, "yes")
     ):
-        best = ("yes", p_over, market_line.yes_ask, yes_edge)
-    if p_under >= min_p and no_edge > _thr(p_under) and market_line.no_spread <= max_spread and market_line.no_ask >= MIN_LIMIT_PRICE:
-        cand = ("no", p_under, market_line.no_ask, no_edge)
-        if best is None or cand[3] > best[3]:
+        best = ("yes", p_over_b, p_over, yes_limit, yes_fee, yes_edge)
+    if (
+        p_under_b >= min_p
+        and no_edge > _thr(p_under_b)
+        and market_line.no_spread <= max_spread
+        and market_line.no_ask >= MIN_LIMIT_PRICE
+        and not is_blocked_segment(market_line.line, "no")
+    ):
+        cand = ("no", p_under_b, p_under, no_limit, no_fee, no_edge)
+        if best is None or cand[5] > best[5]:
             best = cand
     if best is None:
         return None
 
-    side, p, c, edge = best
+    side, p, p_cal, limit_price, fee, edge = best
     p_raw_side = p_over_raw if side == "yes" else p_under_raw
-    b = (1.0 - c) / c if c > 0 else 0.0
+    b = (1.0 - limit_price - fee) / limit_price if limit_price > 0 else 0.0
     ev = b * p - (1.0 - p)
     if ev <= float(MIN_EV) or ev > 2.0:
         return None
@@ -307,17 +358,16 @@ def detect_edge(
     if RISKY_BAND_LOW <= p < RISKY_BAND_HIGH:
         kf *= RISKY_BAND_KELLY_MULT
     bet_dollars = min(kf * bankroll, MAX_BET_PCT * bankroll)
-    contracts = dollars_to_contracts(bet_dollars, c)
+    contracts = dollars_to_contracts(bet_dollars, limit_price)
     if contracts <= 0:
         return None
 
     if side == "yes":
-        bid, ask, fair = market_line.yes_bid, market_line.yes_ask, p_over
+        c = float(market_line.yes_ask)
         book_bid, book_ask, book_spread = float(market_line.yes_bid), float(market_line.yes_ask), float(market_line.yes_spread)
     else:
-        bid, ask, fair = market_line.no_bid, market_line.no_ask, p_under
+        c = float(market_line.no_ask)
         book_bid, book_ask, book_spread = float(market_line.no_bid), float(market_line.no_ask), float(market_line.no_spread)
-    limit_price = suggest_limit_price(side=side, bid=bid, ask=ask, model_fair=fair)
 
     return EdgeSignal(
         player_name=prob_result.player_name,
@@ -340,6 +390,8 @@ def detect_edge(
         book_ask=book_ask,
         book_spread=book_spread,
         games_played=int(prob_result.games_played or 0),
+        fee_per_contract=float(fee),
+        p_model_cal=float(p_cal),
     )
 
 
@@ -446,7 +498,9 @@ def execute_signals(
                 predicted_lambda=sig.predicted_lambda,
                 p_model=sig.p_model,
                 p_model_raw=float(sig.p_model_raw),
+                p_model_cal=float(sig.p_model_cal),
                 p_market=p_market,
+                fee_per_contract=float(sig.fee_per_contract),
                 edge=sig.edge,
                 ev=sig.ev,
                 expected_pnl=expected_pnl,
@@ -495,7 +549,9 @@ def execute_signals(
                 predicted_lambda=sig.predicted_lambda,
                 p_model=sig.p_model,
                 p_model_raw=float(sig.p_model_raw),
+                p_model_cal=float(sig.p_model_cal),
                 p_market=p_market,
+                fee_per_contract=float(sig.fee_per_contract),
                 edge=sig.edge,
                 ev=sig.ev,
                 expected_pnl=expected_pnl,

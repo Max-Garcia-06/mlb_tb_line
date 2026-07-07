@@ -94,6 +94,7 @@ def suggest_limit_price(
     ask: float,
     model_fair: float,
     max_cross_spread: float = 0.06,
+    maker: bool = False,
 ) -> float:
     side = (side or "").lower()
     if side not in {"yes", "no"}:
@@ -109,6 +110,10 @@ def suggest_limit_price(
         px = min(ask, model_fair)
     else:
         px = min(max(bid + TICK_SIZE, mid - TICK_SIZE), model_fair)
+
+    # Maker mode: never cross — rest at least one tick inside the ask (no taker fee).
+    if maker:
+        px = min(px, ask - TICK_SIZE)
 
     return _round_to_tick(px)
 

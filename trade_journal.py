@@ -41,7 +41,9 @@ class TradeRow:
     predicted_lambda: float = 0.0
     p_model: float = 0.0
     p_model_raw: float = 0.0
+    p_model_cal: float = 0.0  # calibrated pre-blend side prob (fit-blend input)
     p_market: float = 0.0
+    fee_per_contract: float = 0.0  # expected Kalshi fee at the limit price
     edge: float = 0.0
     ev: float = 0.0
     expected_pnl: float = 0.0

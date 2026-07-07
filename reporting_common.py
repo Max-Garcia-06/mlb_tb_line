@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+from fees import order_fee_usd
+
 
 def pnl_per_contract(side: str, price: float, result: str) -> float | None:
     if result not in {"yes", "no"}:
         return None
     return (1.0 - price) if side == result else (-price)
+
+
+def estimated_order_fee_usd(row: dict, price: float, contracts: int) -> float:
+    """
+    Kalshi fee for a filled trade. Rows journaled after 2026-07-06 carry
+    ``fee_per_contract`` (0.0 for resting/maker fills); older rows always
+    crossed at the ask, so estimate the taker fee at the fill price.
+    """
+    if "fee_per_contract" in row:
+        return float(row.get("fee_per_contract", 0.0) or 0.0) * int(contracts)
+    return order_fee_usd(price, contracts, is_taker=True)
 
 
 def market_yes_no_result(market: dict) -> str:

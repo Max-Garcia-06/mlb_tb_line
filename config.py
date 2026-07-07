@@ -21,6 +21,31 @@ KALSHI_ORDER_URL = os.getenv("KALSHI_ORDER_URL", "https://api.elections.kalshi.c
 # Predictive core: default ordinal logit; set USE_LEGACY_XGB=1 for XGB Tweedie + Poisson/NB head
 USE_LEGACY_XGB = os.getenv("USE_LEGACY_XGB", "").lower() in ("1", "true", "yes")
 
+# Market blend: shrink model probabilities toward the market mid in logit space.
+# w=1 trusts the model fully (pre-July-2026 behavior); w=0 trusts the market.
+# Effective weight: BLEND_WEIGHT env > fitted models/blend_meta.json > DEFAULT_BLEND_WEIGHT.
+USE_MARKET_BLEND = os.getenv("USE_MARKET_BLEND", "true").lower() in ("1", "true", "yes")
+_BLEND_W_RAW = os.getenv("BLEND_WEIGHT")
+BLEND_WEIGHT_OVERRIDE = float(_BLEND_W_RAW) if _BLEND_W_RAW not in (None, "") else None
+DEFAULT_BLEND_WEIGHT = float(os.getenv("DEFAULT_BLEND_WEIGHT", "0.35"))
+MIN_BLEND_ROWS = int(os.getenv("MIN_BLEND_ROWS", "200"))
+BLEND_META_PATH = MODEL_DIR / "blend_meta.json"
+
+# Kalshi trading fees: taker fee = ceil(rate * C * P * (1-P)) cents; resting (maker) orders free.
+KALSHI_TAKER_FEE_RATE = float(os.getenv("KALSHI_TAKER_FEE_RATE", "0.07"))
+KALSHI_MAKER_FEE_RATE = float(os.getenv("KALSHI_MAKER_FEE_RATE", "0.0"))
+
+# Maker mode: rest limit orders one tick inside the ask instead of crossing (no taker fee).
+MAKER_MODE = os.getenv("MAKER_MODE", "true").lower() in ("1", "true", "yes")
+
+# Segments blocked from live signals, as "line:side" pairs (line-1.5 NO lost -11.7% ROI
+# on 417 resolved orders through 2026-07-05). Empty string disables.
+BLOCKED_SEGMENTS = frozenset(
+    tuple(seg.strip().lower().split(":", 1))
+    for seg in os.getenv("BLOCKED_SEGMENTS", "1.5:no").split(",")
+    if ":" in seg
+)
+
 # Edge detection
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.05"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.10"))
@@ -119,8 +144,10 @@ CV_PRIMARY_METRIC = os.getenv("CV_PRIMARY_METRIC", "mean_brier").strip().lower()
 # Distribution to use: "poisson" or "nbinom"
 DISTRIBUTION = os.getenv("DISTRIBUTION", "nbinom")
 
-# Live scan: only include games starting within this many hours (0 = full pre-game slate)
-SCAN_WITHIN_HOURS = float(os.getenv("SCAN_WITHIN_HOURS", "2"))
+# Live scan + backtest: only include games starting within this many hours (0 = full pre-game
+# slate). Tightened 2 → 1.5 on 2026-07-06: fills marked 120m later showed -0.107/contract CLV
+# vs +0.021 at 30m — early entries were getting run over by later lineup/pitcher info.
+SCAN_WITHIN_HOURS = float(os.getenv("SCAN_WITHIN_HOURS", "1.5"))
 
 # Segment health (segment-report go/no-go)
 SEGMENT_MIN_FILLS = int(os.getenv("SEGMENT_MIN_FILLS", "5"))
