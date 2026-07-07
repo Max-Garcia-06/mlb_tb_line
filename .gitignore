@@ -26,6 +26,7 @@ logs/
 # Local data (DB, journals, ledger — regenerate or keep private)
 data/*.db
 data/*.db.bak*
+data/*.db.*.bak
 data/*.jsonl
 data/execution_ledger.json
 data/statcast_cache/
