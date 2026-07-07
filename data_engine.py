@@ -24,7 +24,8 @@ import statsapi
 from config import DB_PATH, MLB_API_MAX_RETRIES, MLB_API_RETRY_SLEEP_SEC, SEASONS
 from venue_physics import lookup_park_physics
 from matchup_features import (
-    _pitcher_hand_from_name,
+    _pitcher_hand_from_id,
+    _team_id_to_abbr,
     build_bats_hand_cache,
     enrich_batter_row_from_boxscore,
     schedule_games_by_date,
@@ -314,16 +315,26 @@ def filter_market_lines_pregame(
 
 @lru_cache(maxsize=512)
 def _opp_sp_hand_L_by_game_id(game_date: str) -> dict[int, tuple[float, float]]:
-    """game_id -> (away_sp_hand_L, home_sp_hand_L) from schedule probable pitchers."""
+    """game_id -> (away_sp_hand_L, home_sp_hand_L), resolved by pitcher id.
+
+    Uses ``get_probable_starters`` (id-based, from the hydrated schedule
+    endpoint) instead of searching the probable-pitcher name string through
+    the current-season active-roster snapshot, which silently misses anyone
+    not rostered at call time.
+    """
+    probable = get_probable_starters(game_date)
+    abbr = _team_id_to_abbr()
     out: dict[int, tuple[float, float]] = {}
     for g in schedule_games_by_date(game_date):
         gid = int(g.get("game_id", 0) or 0)
         if not gid:
             continue
-        away_sp = str(g.get("away_probable_pitcher", "") or "").strip()
-        home_sp = str(g.get("home_probable_pitcher", "") or "").strip()
-        ah = _pitcher_hand_from_name(away_sp)
-        hh = _pitcher_hand_from_name(home_sp)
+        away_abbr = abbr.get(int(g.get("away_id", 0) or 0), "")
+        home_abbr = abbr.get(int(g.get("home_id", 0) or 0), "")
+        away_pid = int(probable.get(away_abbr, 0) or 0)
+        home_pid = int(probable.get(home_abbr, 0) or 0)
+        ah = _pitcher_hand_from_id(away_pid) if away_pid else "R"
+        hh = _pitcher_hand_from_id(home_pid) if home_pid else "R"
         out[gid] = (
             1.0 if str(ah).upper().startswith("L") else 0.0,
             1.0 if str(hh).upper().startswith("L") else 0.0,
