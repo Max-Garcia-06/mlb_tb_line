@@ -182,7 +182,16 @@ For each player/line/side at scan time:
 | `report` / `report-range` | P&L, fee drag, calibration gaps, segment slices | nightly / weekly |
 | `calibrate` | segmented isotonic from fills (needs ≥50 rows) | weekly-ish |
 | `fit-blend` | blend weight `w` from resolved fills | weekly-ish; after model changes |
+| `model-vs-market` | model vs book log-loss/Brier on FULL snapshot slates (no trade-selection bias), sliced by line/disagreement/date with per-slice fitted `w` | after model changes; as snapshot data accumulates |
 | `segment-report` | go/no-go per line/side segment (uses CLV) | weekly |
+
+`model-vs-market` is the primary model-research scoreboard: `fit-blend` can only
+say the model lost *where it used to trade*; this scores every snapshotted
+market and shows where (if anywhere) the model earns blend weight. Snapshots
+are captured **every 2h, 10:00–22:00 ET** (cron, since 2026-07-06 — previously
+once/day at 10:00 ET), so slice quality improves daily. Default run uses the
+saved model (look-ahead in the model's favor — a market win is decisive);
+confirm any model win with `--pit-train`.
 
 The honest scoreboard is **net-of-fee P&L and CLV**, not model-expected P&L.
 
@@ -192,6 +201,16 @@ The honest scoreboard is **net-of-fee P&L and CLV**, not model-expected P&L.
 
 As of 2026-07-06 the system is live but effectively **paused by its own
 statistics** (w=0.02 ⇒ almost no qualifying edges). That is by design.
+
+First full-slate `model-vs-market` run (5,489 markets, 16 snapshot days,
+saved model = look-ahead in the model's favor) confirmed it independently of
+the fill-based fit: market log-loss 0.4644 vs model 0.5853, w_fit=0.01
+overall, and the model loses *more* the more it disagrees with the book
+(ΔLL +0.15 at ≥0.15 disagreement). Worst segment: line 4.5 (ΔLL +0.33 —
+tail-line saturation; the 2026-07-06 logit clamp in `market_blend.py` guards
+the blend against exactly that). Line 1.5 is the least bad (w_fit=0.10).
+The apparent model "wins" at 6.5/7.5 are N≤35 markets with 5¢ floor asks —
+longshot bias, untradable under `MIN_LIMIT_PRICE`.
 
 To earn trading volume back:
 

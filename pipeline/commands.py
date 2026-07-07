@@ -1885,6 +1885,89 @@ def fit_blend(
     _success(f"Saved blend weight w={w:.2f} to models/blend_meta.json (scan applies it automatically).")
 
 
+def model_vs_market(
+    start: str = typer.Option(..., "--start", help="Start date YYYY-MM-DD (inclusive)."),
+    end: str = typer.Option(..., "--end", help="End date YYYY-MM-DD (inclusive)."),
+    pit_train: bool = typer.Option(False, "--pit-train/--no-pit-train", help="Point-in-time model retraining (slow, no look-ahead)."),
+    earliest: bool = typer.Option(False, "--earliest", help="Score at the earliest snapshot per ticker instead of the latest."),
+):
+    """
+    Score model vs market probabilities on FULL snapshot slates (no trade filter).
+
+    For every snapshotted market with a sane book and a boxscore outcome,
+    compares calibrated model P(over) and the market yes-mid on log-loss /
+    Brier, sliced by line, disagreement, and date — with a fitted blend
+    weight per slice showing where (if anywhere) the model earns weight.
+    """
+    from datetime import timedelta
+
+    from journal_reader import parse_iso_date
+    from model_vs_market import evaluate_day, summarize
+
+    start_d, end_d = parse_iso_date(start), parse_iso_date(end)
+    if end_d < start_d:
+        _warn("--end must be >= --start")
+        raise typer.Exit(2)
+
+    _header(f"Model vs Market — {start} → {end}")
+    if not pit_train:
+        _warn(
+            "Saved model may have trained on these dates (look-ahead in the model's favor). "
+            "A market win here is decisive; a model win should be re-checked with --pit-train."
+        )
+
+    rows = []
+    d = start_d
+    while d <= end_d:
+        ds = d.strftime("%Y-%m-%d")
+        day_rows = evaluate_day(ds, pit_train=pit_train, earliest=earliest)
+        if day_rows:
+            console.print(f"[dim]{ds}: {len(day_rows)} scored markets[/dim]")
+        rows.extend(day_rows)
+        d += timedelta(days=1)
+    if not rows:
+        _warn("No scoreable markets (need snapshots + ETL'd boxscores for the range).")
+        raise typer.Exit(0)
+
+    summary = summarize(rows)
+
+    def _print_slice(title: str, data: dict[str, dict]) -> None:
+        t = Table(title=title, box=box.SIMPLE_HEAD)
+        t.add_column("Group")
+        t.add_column("N", justify="right")
+        t.add_column("Base", justify="right")
+        t.add_column("LL model", justify="right")
+        t.add_column("LL market", justify="right")
+        t.add_column("ΔLL", justify="right")
+        t.add_column("Brier mdl", justify="right")
+        t.add_column("Brier mkt", justify="right")
+        t.add_column("w fit", justify="right")
+        for k, s in data.items():
+            delta = s["ll_model"] - s["ll_market"]
+            color = "green" if delta < 0 else "red"
+            t.add_row(
+                k,
+                str(s["n"]),
+                f"{s['base_rate']:.3f}",
+                f"{s['ll_model']:.4f}",
+                f"{s['ll_market']:.4f}",
+                f"[{color}]{delta:+.4f}[/{color}]",
+                f"{s['brier_model']:.4f}",
+                f"{s['brier_market']:.4f}",
+                f"{s['w_fit']:.2f}",
+            )
+        console.print(t)
+
+    _print_slice("Overall (ΔLL < 0 ⇒ model beats market)", summary["overall"])
+    _print_slice("By Kalshi line", summary["line"])
+    _print_slice("By |model − market| disagreement", summary["disagreement"])
+    _print_slice("By date", summary["date"])
+    console.print(
+        "[dim]w fit = blend weight minimizing log-loss within the slice "
+        "(0 = market knows best, 1 = model knows best). Fitted in-slice — treat small-N slices as noise.[/dim]"
+    )
+
+
 def segment_report(
     start: str = typer.Option(None, "--start", help="Start date YYYY-MM-DD. Default: 14 days ago."),
     end: str = typer.Option(None, "--end", help="End date YYYY-MM-DD. Default: today."),

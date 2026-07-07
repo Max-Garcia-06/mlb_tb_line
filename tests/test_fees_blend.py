@@ -26,6 +26,14 @@ def test_blend_endpoints_and_monotonicity():
     assert 0.5 < mid < 0.8
 
 
+def test_blend_damps_saturated_calibrator_output():
+    # Isotonic calibrators can emit exactly 1.0; a low w must not let that
+    # extreme logit manufacture an edge over the market mid.
+    p = blend_probability(1.0, 0.875, 0.02)
+    assert p == pytest.approx(blend_probability(0.99, 0.875, 0.02))
+    assert p - 0.875 < 0.02
+
+
 def test_fit_blend_weight_recovers_market_when_model_is_noise():
     # Outcomes drawn to match the market prob exactly; model says 0.9 always.
     rows = []

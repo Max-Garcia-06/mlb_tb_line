@@ -27,11 +27,14 @@ from config import BLEND_META_PATH, BLEND_WEIGHT_OVERRIDE, DEFAULT_BLEND_WEIGHT,
 log = logging.getLogger(__name__)
 
 _P_EPS = 1e-4
+# Logit inputs are clamped to [0.01, 0.99]: isotonic calibrators can saturate at
+# exactly 0/1, and logit(1-1e-6) ≈ 13.8 lets even a tiny w manufacture edges.
+_LOGIT_CLAMP = 0.01
 _CACHED_WEIGHT: Optional[float] = None
 
 
 def _logit(p: float) -> float:
-    p = min(1.0 - _P_EPS, max(_P_EPS, float(p)))
+    p = min(1.0 - _LOGIT_CLAMP, max(_LOGIT_CLAMP, float(p)))
     return math.log(p / (1.0 - p))
 
 
