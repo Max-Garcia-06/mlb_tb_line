@@ -695,6 +695,10 @@ def build_historical_store(
     workers: int = 8,
     incremental: bool = False,
     fetch_weather: bool = False,
+    # NOTE: incremental=False re-stamps opp_sp_hand_L from the announced probable
+    # starter (_opp_sp_hand_L_by_game_id), not the actual starter. A full
+    # non-incremental re-ingest will silently overwrite the corrections made by
+    # backfill_opp_sp_hand.py (which uses the actual starter from pitcher_games).
 ) -> None:
     seasons = seasons or SEASONS
     engine = _engine()

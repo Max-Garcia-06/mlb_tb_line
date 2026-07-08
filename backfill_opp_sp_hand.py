@@ -9,6 +9,13 @@ starter's pitcher_id, resolves hand via matchup_features._pitcher_hand_from_id
 Run once after the pitcher-hand resolution fix (matchup_features.py /
 data_engine.py). Rows whose game_id has no matching starter in pitcher_games
 are left unchanged.
+
+Note: this uses the ACTUAL starter (pitcher_games.is_starter=1), while the
+forward-looking ETL (data_engine._opp_sp_hand_L_by_game_id) uses the
+ANNOUNCED PROBABLE starter -- the two can differ when a probable is scratched
+for an opposite-handed replacement. A full non-incremental re-run of
+data_engine.build_historical_store will re-stamp historical rows from the
+probable starter, overwriting this backfill's corrections.
 """
 from __future__ import annotations
 
