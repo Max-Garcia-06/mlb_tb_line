@@ -85,10 +85,12 @@ MODEL_FEATURES = (
     + [
         # Statcast-style environment (venue priors + game-day weather; see data_engine ETL)
         "venue_distance_added_index",
-        "venue_elevation_ft",
+        "venue_elevation_norm",
         "game_temp_norm",
         "game_wind_carry",
-        "statcast_env_lift",
+        # statcast_env_lift intentionally excluded: it's a fixed linear combination
+        # of the four features above, which made the design matrix near rank-deficient
+        # (condition number ~9e14) and blocked LBFGS/Hessian convergence.
         # Opposing starter rolling stats (last 5 starts, shifted to avoid leakage)
         "opp_sp_era_roll",
         "opp_sp_k9_roll",
@@ -320,6 +322,7 @@ def _ensure_env_columns(df: pd.DataFrame) -> pd.DataFrame:
     wlr = pd.to_numeric(df["wind_l_to_r"], errors="coerce").fillna(0).clip(0, 1)
     df["game_wind_carry"] = (wlr * (wm / 20.0)).clip(0, 2.5)
     elev_n = df["venue_elevation_ft"] / 5280.0
+    df["venue_elevation_norm"] = elev_n
     df["statcast_env_lift"] = (
         df["venue_distance_added_index"]
         + 0.015 * df["game_temp_norm"]

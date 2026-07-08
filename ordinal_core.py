@@ -109,7 +109,7 @@ def fit_ordinal_logit(X: pd.DataFrame, y_tb: np.ndarray, disp: bool = False) -> 
     y_levels = tb_values_to_levels(y_tb)
     y_series = pd.Series(np.asarray(y_levels, dtype=int)).reset_index(drop=True)
     model = OrderedModel(y_series, X_fit, distr="logit")
-    res = model.fit(method="lbfgs", disp=disp, maxiter=200)
+    res = model.fit(method="lbfgs", disp=disp, maxiter=1000)
     # Stash the kept column list so predict_pmf can stay column-aligned even
     # when callers pass the original (untrimmed) feature DataFrame.
     try:
