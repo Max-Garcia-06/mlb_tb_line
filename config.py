@@ -28,6 +28,9 @@ USE_MARKET_BLEND = os.getenv("USE_MARKET_BLEND", "true").lower() in ("1", "true"
 _BLEND_W_RAW = os.getenv("BLEND_WEIGHT")
 BLEND_WEIGHT_OVERRIDE = float(_BLEND_W_RAW) if _BLEND_W_RAW not in (None, "") else None
 DEFAULT_BLEND_WEIGHT = float(os.getenv("DEFAULT_BLEND_WEIGHT", "0.35"))
+# Floor on the fitted weight: small resolved-fill samples can grid-search into a
+# noisy near-zero w, discarding the model entirely rather than truly showing no signal.
+MIN_BLEND_WEIGHT = float(os.getenv("MIN_BLEND_WEIGHT", "0.3"))
 MIN_BLEND_ROWS = int(os.getenv("MIN_BLEND_ROWS", "200"))
 BLEND_META_PATH = MODEL_DIR / "blend_meta.json"
 

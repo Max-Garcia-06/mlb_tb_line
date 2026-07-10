@@ -22,7 +22,7 @@ import math
 from datetime import datetime, timezone
 from typing import Optional
 
-from config import BLEND_META_PATH, BLEND_WEIGHT_OVERRIDE, DEFAULT_BLEND_WEIGHT, USE_MARKET_BLEND
+from config import BLEND_META_PATH, BLEND_WEIGHT_OVERRIDE, DEFAULT_BLEND_WEIGHT, MIN_BLEND_WEIGHT, USE_MARKET_BLEND
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +69,9 @@ def load_blend_weight() -> float:
     try:
         meta = json.loads(BLEND_META_PATH.read_text())
         w = float(meta["w"])
+        if w < MIN_BLEND_WEIGHT:
+            log.info("Fitted blend weight w=%.4f below floor; using floor w=%.2f", w, MIN_BLEND_WEIGHT)
+            w = MIN_BLEND_WEIGHT
     except FileNotFoundError:
         log.info("No fitted blend weight (%s missing); using default w=%.2f", BLEND_META_PATH, w)
     except (KeyError, ValueError, json.JSONDecodeError) as e:

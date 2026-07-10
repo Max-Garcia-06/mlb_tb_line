@@ -59,10 +59,24 @@ def test_load_blend_weight_reads_meta(tmp_path, monkeypatch):
     import market_blend
 
     meta = tmp_path / "blend_meta.json"
-    meta.write_text(json.dumps({"w": 0.25}))
+    meta.write_text(json.dumps({"w": 0.5}))
     monkeypatch.setattr(market_blend, "BLEND_META_PATH", meta)
     monkeypatch.setattr(market_blend, "USE_MARKET_BLEND", True)
     monkeypatch.setattr(market_blend, "BLEND_WEIGHT_OVERRIDE", None)
     market_blend.reset_blend_cache()
-    assert market_blend.load_blend_weight() == pytest.approx(0.25)
+    assert market_blend.load_blend_weight() == pytest.approx(0.5)
+    market_blend.reset_blend_cache()
+
+
+def test_load_blend_weight_applies_floor(tmp_path, monkeypatch):
+    import market_blend
+
+    meta = tmp_path / "blend_meta.json"
+    meta.write_text(json.dumps({"w": 0.02}))
+    monkeypatch.setattr(market_blend, "BLEND_META_PATH", meta)
+    monkeypatch.setattr(market_blend, "USE_MARKET_BLEND", True)
+    monkeypatch.setattr(market_blend, "BLEND_WEIGHT_OVERRIDE", None)
+    monkeypatch.setattr(market_blend, "MIN_BLEND_WEIGHT", 0.3)
+    market_blend.reset_blend_cache()
+    assert market_blend.load_blend_weight() == pytest.approx(0.3)
     market_blend.reset_blend_cache()
