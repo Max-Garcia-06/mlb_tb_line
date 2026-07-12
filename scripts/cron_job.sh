@@ -65,7 +65,7 @@ case "$JOB" in
     run_py snapshot --date "$TODAY_ET"
     ;;
   etl)
-    run_py etl
+    run_py etl --incremental --workers 8
     ;;
   reconcile)
     # After games: journal for yesterday's slate (2 AM job is usually post-evening slate)
@@ -76,7 +76,7 @@ case "$JOB" in
     ;;
   nightly)
     # ETL, reconcile yesterday's fills, then report against them
-    run_py etl
+    run_py etl --incremental --workers 8
     run_py reconcile --date "$YESTERDAY_ET"
     run_py report --date "$YESTERDAY_ET"
     ;;

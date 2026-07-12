@@ -49,15 +49,20 @@ def _event_ticker_from_ml(ml0) -> str:
     return et
 
 
-def etl(seasons: str = typer.Option(None, "--seasons", help="Comma-separated seasons (years), e.g. '2023,2024'")):
+def etl(
+    seasons: str = typer.Option(None, "--seasons", help="Comma-separated seasons (years), e.g. '2023,2024'"),
+    incremental: bool = typer.Option(False, "--incremental", help="Only pull games not already in the DB."),
+    workers: int = typer.Option(8, "--workers", help="Parallel fetch workers."),
+):
     _header("Phase 1 — ETL: Pull MLB Batter Games")
     import data_engine as de
     from config import SEASONS, DB_PATH
 
     season_list = [int(s.strip()) for s in seasons.split(",")] if seasons else SEASONS
-    console.print(f"Seasons  : {season_list}")
-    console.print(f"Database : {DB_PATH}\n")
-    de.build_historical_store(season_list)
+    console.print(f"Seasons    : {season_list}")
+    console.print(f"Incremental: {incremental}")
+    console.print(f"Database   : {DB_PATH}\n")
+    de.build_historical_store(season_list, workers=workers, incremental=incremental)
     _success("ETL complete.")
 
 
