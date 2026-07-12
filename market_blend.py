@@ -22,7 +22,15 @@ import math
 from datetime import datetime, timezone
 from typing import Optional
 
-from config import BLEND_META_PATH, BLEND_WEIGHT_OVERRIDE, DEFAULT_BLEND_WEIGHT, MIN_BLEND_WEIGHT, USE_MARKET_BLEND
+from config import (
+    BLEND_META_PATH,
+    BLEND_WEIGHT_OVERRIDE,
+    DEFAULT_BLEND_WEIGHT,
+    MIN_BLEND_ROWS_SEGMENT,
+    MIN_BLEND_WEIGHT,
+    SEGMENT_BLEND_META_PATH,
+    USE_MARKET_BLEND,
+)
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +39,21 @@ _P_EPS = 1e-4
 # exactly 0/1, and logit(1-1e-6) ≈ 13.8 lets even a tiny w manufacture edges.
 _LOGIT_CLAMP = 0.01
 _CACHED_WEIGHT: Optional[float] = None
+_CACHED_SEGMENT_WEIGHTS: Optional[dict[str, float]] = None
+
+DISAGREEMENT_BUCKETS = ("<0.05", "0.05-0.10", "0.10-0.15", ">=0.15")
+
+
+def disagreement_bucket(p_model: float, p_market: float) -> str:
+    """Bucket label for |p_model - p_market|; see DISAGREEMENT_BUCKETS."""
+    d = abs(float(p_model) - float(p_market))
+    if d < 0.05:
+        return "<0.05"
+    if d < 0.10:
+        return "0.05-0.10"
+    if d < 0.15:
+        return "0.10-0.15"
+    return ">=0.15"
 
 
 def _logit(p: float) -> float:
@@ -49,20 +72,48 @@ def blend_probability(p_model: float, p_market: float, w: float) -> float:
 
 
 def reset_blend_cache() -> None:
-    global _CACHED_WEIGHT
+    global _CACHED_WEIGHT, _CACHED_SEGMENT_WEIGHTS
     _CACHED_WEIGHT = None
+    _CACHED_SEGMENT_WEIGHTS = None
 
 
-def load_blend_weight() -> float:
+def _load_segment_weights() -> dict[str, float]:
+    """Fitted per-bucket weights meeting MIN_BLEND_ROWS_SEGMENT, floored at MIN_BLEND_WEIGHT."""
+    global _CACHED_SEGMENT_WEIGHTS
+    if _CACHED_SEGMENT_WEIGHTS is not None:
+        return _CACHED_SEGMENT_WEIGHTS
+    weights: dict[str, float] = {}
+    try:
+        meta = json.loads(SEGMENT_BLEND_META_PATH.read_text())
+        for bucket, seg in (meta.get("segments") or {}).items():
+            if int(seg.get("n_rows", 0)) < MIN_BLEND_ROWS_SEGMENT:
+                continue
+            w = float(seg["w"])
+            weights[bucket] = min(1.0, max(MIN_BLEND_WEIGHT, w))
+    except FileNotFoundError:
+        pass
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
+        log.warning("Could not read segment blend weights from %s (%s)", SEGMENT_BLEND_META_PATH, e)
+    _CACHED_SEGMENT_WEIGHTS = weights
+    return weights
+
+
+def load_blend_weight(p_model: Optional[float] = None, p_market: Optional[float] = None) -> float:
     """
-    Effective blend weight: env override > fitted models/blend_meta.json >
-    DEFAULT_BLEND_WEIGHT. Returns 1.0 (no shrink) when USE_MARKET_BLEND is off.
+    Effective blend weight: env override > per-segment fit (needs p_model/p_market)
+    > fitted models/blend_meta.json > DEFAULT_BLEND_WEIGHT. Returns 1.0 (no shrink)
+    when USE_MARKET_BLEND is off.
     """
     global _CACHED_WEIGHT
     if not USE_MARKET_BLEND:
         return 1.0
     if BLEND_WEIGHT_OVERRIDE is not None:
         return float(BLEND_WEIGHT_OVERRIDE)
+    if p_model is not None and p_market is not None:
+        bucket = disagreement_bucket(p_model, p_market)
+        seg_w = _load_segment_weights().get(bucket)
+        if seg_w is not None:
+            return seg_w
     if _CACHED_WEIGHT is not None:
         return _CACHED_WEIGHT
     w = float(DEFAULT_BLEND_WEIGHT)
@@ -134,4 +185,23 @@ def save_blend_meta(w: float, diag: dict, *, start: str, end: str) -> None:
     }
     BLEND_META_PATH.parent.mkdir(parents=True, exist_ok=True)
     BLEND_META_PATH.write_text(json.dumps(meta, indent=2))
+    reset_blend_cache()
+
+
+def save_segment_blend_meta(segments: dict[str, tuple[float, dict]], *, start: str, end: str) -> None:
+    """``segments``: bucket label -> (w_fit, diag) from fit_blend_weight, one per disagreement bucket."""
+    meta = {
+        "fitted_at": datetime.now(timezone.utc).isoformat(),
+        "start": start,
+        "end": end,
+        "segments": {
+            bucket: {
+                "w": float(w),
+                **{k: (float(v) if isinstance(v, (int, float)) else v) for k, v in diag.items()},
+            }
+            for bucket, (w, diag) in segments.items()
+        },
+    }
+    SEGMENT_BLEND_META_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SEGMENT_BLEND_META_PATH.write_text(json.dumps(meta, indent=2))
     reset_blend_cache()

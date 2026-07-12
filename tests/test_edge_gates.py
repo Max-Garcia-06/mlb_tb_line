@@ -9,7 +9,7 @@ from probability_engine import ProbabilityResult
 @pytest.fixture(autouse=True)
 def _model_only_blend(monkeypatch):
     """Neutralize the blend (w=1) so gate tests exercise one thing at a time."""
-    monkeypatch.setattr(edge_detector, "load_blend_weight", lambda: 1.0)
+    monkeypatch.setattr(edge_detector, "load_blend_weight", lambda *a, **k: 1.0)
 
 
 def _pr(p_over: float, line: float = 1.5) -> ProbabilityResult:
@@ -75,7 +75,7 @@ def test_maker_mode_rests_inside_ask_with_no_fee(monkeypatch):
 
 
 def test_blend_shrinks_edge_toward_market(monkeypatch):
-    monkeypatch.setattr(edge_detector, "load_blend_weight", lambda: 0.5)
+    monkeypatch.setattr(edge_detector, "load_blend_weight", lambda *a, **k: 0.5)
     monkeypatch.setattr(edge_detector, "MAKER_MODE", False)
     p_blend, _, _, _ = quote_side_edge(0.70, bid=0.48, ask=0.50, side="yes")
     assert 0.49 < p_blend < 0.70

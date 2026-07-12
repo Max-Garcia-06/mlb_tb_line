@@ -3,7 +3,7 @@ import json
 import pytest
 
 from fees import fee_per_contract, order_fee_usd
-from market_blend import blend_probability, fit_blend_weight
+from market_blend import blend_probability, disagreement_bucket, fit_blend_weight
 
 
 def test_taker_fee_matches_kalshi_schedule():
@@ -79,4 +79,54 @@ def test_load_blend_weight_applies_floor(tmp_path, monkeypatch):
     monkeypatch.setattr(market_blend, "MIN_BLEND_WEIGHT", 0.3)
     market_blend.reset_blend_cache()
     assert market_blend.load_blend_weight() == pytest.approx(0.3)
+    market_blend.reset_blend_cache()
+
+
+def test_disagreement_bucket_boundaries():
+    assert disagreement_bucket(0.50, 0.51) == "<0.05"
+    assert disagreement_bucket(0.50, 0.56) == "0.05-0.10"
+    assert disagreement_bucket(0.50, 0.61) == "0.10-0.15"
+    assert disagreement_bucket(0.50, 0.70) == ">=0.15"
+    assert disagreement_bucket(0.70, 0.50) == ">=0.15"  # order-independent
+
+
+def test_load_blend_weight_uses_segment_when_available(tmp_path, monkeypatch):
+    import market_blend
+
+    global_meta = tmp_path / "blend_meta.json"
+    global_meta.write_text(json.dumps({"w": 0.3}))
+    seg_meta = tmp_path / "blend_meta_segments.json"
+    seg_meta.write_text(json.dumps({"segments": {">=0.15": {"w": 0.2, "n_rows": 140}}}))
+    monkeypatch.setattr(market_blend, "BLEND_META_PATH", global_meta)
+    monkeypatch.setattr(market_blend, "SEGMENT_BLEND_META_PATH", seg_meta)
+    monkeypatch.setattr(market_blend, "MIN_BLEND_ROWS_SEGMENT", 100)
+    monkeypatch.setattr(market_blend, "MIN_BLEND_WEIGHT", 0.3)
+    monkeypatch.setattr(market_blend, "USE_MARKET_BLEND", True)
+    monkeypatch.setattr(market_blend, "BLEND_WEIGHT_OVERRIDE", None)
+    market_blend.reset_blend_cache()
+
+    # >=0.15 disagreement: segment fit (0.2) floored at MIN_BLEND_WEIGHT (0.3).
+    assert market_blend.load_blend_weight(0.80, 0.60) == pytest.approx(0.3)
+    # No p_model/p_market given -> falls back to the global weight, unaffected by segments.
+    assert market_blend.load_blend_weight() == pytest.approx(0.3)
+    market_blend.reset_blend_cache()
+
+
+def test_load_blend_weight_falls_back_below_segment_min_rows(tmp_path, monkeypatch):
+    import market_blend
+
+    global_meta = tmp_path / "blend_meta.json"
+    global_meta.write_text(json.dumps({"w": 0.4}))
+    seg_meta = tmp_path / "blend_meta_segments.json"
+    seg_meta.write_text(json.dumps({"segments": {"<0.05": {"w": 0.9, "n_rows": 50}}}))
+    monkeypatch.setattr(market_blend, "BLEND_META_PATH", global_meta)
+    monkeypatch.setattr(market_blend, "SEGMENT_BLEND_META_PATH", seg_meta)
+    monkeypatch.setattr(market_blend, "MIN_BLEND_ROWS_SEGMENT", 100)
+    monkeypatch.setattr(market_blend, "MIN_BLEND_WEIGHT", 0.3)
+    monkeypatch.setattr(market_blend, "USE_MARKET_BLEND", True)
+    monkeypatch.setattr(market_blend, "BLEND_WEIGHT_OVERRIDE", None)
+    market_blend.reset_blend_cache()
+
+    # Segment has only 50 rows (<MIN_BLEND_ROWS_SEGMENT) -> ignored, falls back to global.
+    assert market_blend.load_blend_weight(0.50, 0.51) == pytest.approx(0.4)
     market_blend.reset_blend_cache()

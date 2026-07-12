@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run a single pipeline step for cron (logging, venv, ET dates).
-# Usage: scripts/cron_job.sh <snapshot|etl|reconcile|report|nightly>
+# Usage: scripts/cron_job.sh <snapshot|etl|reconcile|report|nightly|refit-blend>
 
 set -euo pipefail
 
@@ -12,7 +12,7 @@ mkdir -p "$LOG_DIR"
 
 JOB="${1:-}"
 if [[ -z "$JOB" ]]; then
-  echo "Usage: $0 <snapshot|etl|reconcile|report|nightly>" >&2
+  echo "Usage: $0 <snapshot|etl|reconcile|report|nightly|refit-blend>" >&2
   exit 1
 fi
 
@@ -79,6 +79,12 @@ case "$JOB" in
     run_py etl
     run_py reconcile --date "$YESTERDAY_ET"
     run_py report --date "$YESTERDAY_ET"
+    ;;
+  refit-blend)
+    # Re-fit market-blend weight (global + per-segment) from a trailing window of
+    # full-slate scoring, so w tracks the model's actual recent performance vs.
+    # the market instead of staying pinned wherever it was last set by hand.
+    run_py refit-blend
     ;;
   scan)
     # Dry-run edge scan — logs to scan.log, no orders placed

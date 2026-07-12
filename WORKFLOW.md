@@ -307,13 +307,22 @@ python3 run_pipeline.py segment-report --start 2026-05-01 --end 2026-05-24
 
 ## 6. Cron automation
 
-Three job types run automatically. All are defined between `# BEGIN mlb_tb_line` and `# END mlb_tb_line` in crontab.
+Four job types run automatically. All are defined between `# BEGIN mlb_tb_line` and `# END mlb_tb_line` in crontab.
 
-| Schedule (US/Eastern) | Job | What it runs | Log |
+| Schedule | Job | What it runs | Log |
 |------------------------|-----|----------------|-----|
-| **02:00** daily | `nightly` | `etl` → `report --date yesterday` (reconcile on) | `logs/cron.log` |
-| **10:00** daily | `snapshot` | `snapshot --date today` (pre-game tape) | `logs/cron.log` |
-| **10:00–22:00** hourly | `scan-live` | `scan --live --date today` | `logs/scan.log` |
+| **02:00 ET** daily | `nightly` | `etl` → `report --date yesterday` (reconcile on) | `logs/cron.log` |
+| **10:00 ET** daily | `snapshot` | `snapshot --date today` (pre-game tape) | `logs/cron.log` |
+| **10:00–22:00 ET** hourly | `scan-live` | `scan --live --date today` | `logs/scan.log` |
+| **05:00 system-local**, Sundays | `refit-blend` | `refit-blend` (global + per-bucket market-blend weight, 30d trailing full-slate scoring; see `SYSTEM.md` §3.9/§8) | `logs/cron.log` |
+
+`refit-blend` is scheduled in system-local time, not ET — it isn't
+slate-sensitive, and it's timed to land well clear of the nightly ETL job in
+case that runs long (it has a history of OOM failures — check `logs/cron.log`
+if `models/blend_meta*.json` timestamps stop updating weekly). It takes
+tens of minutes (full-slate scoring is not cheap); a manual run over a
+longer window (e.g. seeding from `fit-blend-segments --start ... --end ...`)
+can take significantly longer — kick it off in the background.
 
 The hourly `scan-live` jobs replace markets at each top-of-hour. The `--within-hours` window (default 2 h, or `SCAN_WITHIN_HOURS` in `.env`) limits each run to games starting soon, so early runs don't trade night-game books.
 
@@ -360,6 +369,8 @@ Requires your Mac to be **plugged in** (and ideally lid open or clamshell with e
 | Multi-day P&L | `report-range --start ... --end ...` | Anytime |
 | Rebuild features only | `materialize-features` | After ETL if table stale |
 | Retune XGB | `tune` | Occasionally if using legacy head |
+| Refit market-blend weight (global + segments) | `refit-blend` | Also in cron `refit-blend` (weekly, automatic) |
+| Full-slate model-vs-market audit | `model-vs-market --start ... --end ...` | After model changes, or to sanity-check `refit-blend` output |
 
 Full ETL rebuild (slow):
 
@@ -383,6 +394,8 @@ python3 run_pipeline.py train
 | `data/KILL_SWITCH` | Present = no live orders |
 | `data/pipeline.jsonl` | Structured logs if `STRUCTURED_LOG=1` |
 | `models/*.pkl` | Model + calibrators |
+| `models/blend_meta.json` | Global market-blend weight `w` + fit diagnostics (`fit-blend` or `refit-blend`) |
+| `models/blend_meta_segments.json` | Per-disagreement-bucket blend weights (`fit-blend-segments` or `refit-blend`) |
 
 ---
 
@@ -402,6 +415,10 @@ python3 run_pipeline.py train
 | `report` | Reconcile + single-day performance (default) |
 | `report-range` | Reconcile each day in range + multi-day aggregate (default) |
 | `calibrate` | Fit isotonic calibrator from fills |
+| `fit-blend` | Fit global blend weight from resolved fills (selection-biased; diagnostic) |
+| `fit-blend-segments` | Fit per-disagreement-bucket blend weight from full-slate scoring, explicit date range |
+| `refit-blend` | `fit-blend` + `fit-blend-segments` combined, from full-slate scoring over a rolling trailing window — the automatic version; also runs weekly via cron |
+| `model-vs-market` | Model vs. book log-loss/Brier on full snapshot slates, sliced by line/disagreement/date — read-only report |
 | `backtest` | Replay snapshots vs actual TB |
 | `materialize-features` | Rebuild `batter_features` table |
 

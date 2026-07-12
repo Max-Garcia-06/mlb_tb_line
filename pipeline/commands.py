@@ -18,6 +18,28 @@ from cli.output import console, _header, _success, _warn
 log = logging.getLogger(__name__)
 
 
+def _email_scan_summary(game_date, signals, total_xp, results=None) -> None:
+    from notify import send_email
+
+    mode = "LIVE" if results is not None else "DRY RUN"
+    subj = f"[MLB TB] {game_date} — {len(signals)} edge(s) ({mode})"
+
+    lines = [f"Date: {game_date}  Mode: {mode}", f"Sum E[PnL]: ${total_xp:+.2f}\n", "=== Signals ==="]
+    for s in signals:
+        lines.append(
+            f"{s.player_name:<24} line={s.kalshi_line} {s.recommended_side.upper():<3} "
+            f"edge={s.edge:+.3f} contracts={s.recommended_contracts} ${s.bet_dollars:.2f}"
+        )
+
+    if results is not None:
+        lines.append("\n=== Order Results ===")
+        for r in results:
+            status = "OK" if r.success else "FAILED"
+            lines.append(f"{status:<6} {r.ticker} {r.side} x{r.contracts} @ {r.price:.2f} {r.message}")
+
+    send_email(subj, "\n".join(lines))
+
+
 def _event_ticker_from_ml(ml0) -> str:
     et = str(getattr(ml0, "event_ticker", "") or "")
     if not et and getattr(ml0, "ticker", ""):
@@ -571,8 +593,10 @@ def scan(
                     ]
                     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 console.print(f"\n[dim]Auto-mark scheduled at: {', '.join(f'{d}m' for d in delays)}[/dim]")
+        _email_scan_summary(game_date, signals, total_xp, results=results)
     else:
         _warn("Dry run — no orders placed. Use --live to execute.")
+        _email_scan_summary(game_date, signals, total_xp, results=None)
 
 
 def mark(
@@ -1883,6 +1907,221 @@ def fit_blend(
         raise typer.Exit(0)
     save_blend_meta(w, diag, start=start_d.strftime("%Y-%m-%d"), end=end_d.strftime("%Y-%m-%d"))
     _success(f"Saved blend weight w={w:.2f} to models/blend_meta.json (scan applies it automatically).")
+
+
+def fit_blend_segments(
+    start: str = typer.Option(..., "--start", help="Start date YYYY-MM-DD (inclusive)."),
+    end: str = typer.Option(..., "--end", help="End date YYYY-MM-DD (inclusive)."),
+    min_rows: int = typer.Option(None, "--min-rows", help="Minimum rows per segment to fit (default: MIN_BLEND_ROWS_SEGMENT)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Fit and report, but do not write models/blend_meta_segments.json."),
+):
+    """
+    Fit a market-blend weight ``w`` per |model-market| disagreement bucket.
+
+    Uses full-slate snapshot scoring (like ``model-vs-market``), not fills:
+    fills are edge-selected, so low-disagreement buckets would have near-zero
+    fill coverage. Writes ``models/blend_meta_segments.json``, which ``scan``
+    applies automatically per-bucket (floored at MIN_BLEND_WEIGHT), falling
+    back to the global blend_meta.json weight for buckets under
+    MIN_BLEND_ROWS_SEGMENT.
+    """
+    from datetime import timedelta
+
+    from config import MIN_BLEND_ROWS_SEGMENT
+    from journal_reader import parse_iso_date
+    from market_blend import DISAGREEMENT_BUCKETS, disagreement_bucket, fit_blend_weight, save_segment_blend_meta
+    from model_vs_market import evaluate_day
+
+    start_d, end_d = parse_iso_date(start), parse_iso_date(end)
+    if end_d < start_d:
+        _warn("--end must be >= --start")
+        raise typer.Exit(2)
+
+    _header(f"Fit segment blend weights — {start} → {end}")
+    _warn(
+        "Saved model may have trained on these dates (look-ahead in the model's favor). "
+        "Prefer dates after the model's training cutoff."
+    )
+
+    rows = []
+    d = start_d
+    while d <= end_d:
+        ds = d.strftime("%Y-%m-%d")
+        day_rows = evaluate_day(ds)
+        if day_rows:
+            console.print(f"[dim]{ds}: {len(day_rows)} scored markets[/dim]")
+        rows.extend(day_rows)
+        d += timedelta(days=1)
+    if not rows:
+        _warn("No scoreable markets (need snapshots + ETL'd boxscores for the range).")
+        raise typer.Exit(0)
+
+    min_needed = int(min_rows) if min_rows is not None else int(MIN_BLEND_ROWS_SEGMENT)
+    by_bucket: dict[str, list] = {b: [] for b in DISAGREEMENT_BUCKETS}
+    for r in rows:
+        by_bucket[disagreement_bucket(r.p_model_cal, r.p_market_mid)].append(r)
+
+    t = Table(title="Segment blend fit (by disagreement bucket)", box=box.SIMPLE_HEAD)
+    t.add_column("Bucket")
+    t.add_column("N", justify="right")
+    t.add_column("LL market", justify="right")
+    t.add_column("LL model", justify="right")
+    t.add_column("w fit", justify="right")
+    t.add_column("Status")
+
+    segments: dict[str, tuple[float, dict]] = {}
+    for bucket in DISAGREEMENT_BUCKETS:
+        bucket_rows = by_bucket[bucket]
+        n = len(bucket_rows)
+        if n < min_needed:
+            t.add_row(bucket, str(n), "-", "-", "-", f"[dim]skipped (<{min_needed})[/dim]")
+            continue
+        fit_rows = [{"p": r.p_model_cal, "m": r.p_market_mid, "y": r.y, "weight": 1.0} for r in bucket_rows]
+        w, diag = fit_blend_weight(fit_rows)
+        segments[bucket] = (w, diag)
+        t.add_row(
+            bucket,
+            str(n),
+            f"{diag['logloss_market_only']:.4f}",
+            f"{diag['logloss_model_only']:.4f}",
+            f"{w:.2f}",
+            "[green]fit[/green]",
+        )
+    console.print(t)
+
+    if not segments:
+        _warn(f"No segment cleared the {min_needed}-row minimum. Nothing to save.")
+        raise typer.Exit(0)
+    if dry_run:
+        _warn("Dry run — blend_meta_segments.json not written.")
+        raise typer.Exit(0)
+    save_segment_blend_meta(segments, start=start_d.strftime("%Y-%m-%d"), end=end_d.strftime("%Y-%m-%d"))
+    _success(
+        f"Saved {len(segments)} segment weight(s) to models/blend_meta_segments.json "
+        "(scan applies them automatically, floored at MIN_BLEND_WEIGHT)."
+    )
+
+
+def refit_blend(
+    days: int = typer.Option(None, "--days", help="Lookback window in days (default: BLEND_REFIT_LOOKBACK_DAYS)."),
+    start: str = typer.Option(None, "--start", help="Start date YYYY-MM-DD (inclusive). Overrides --days."),
+    end: str = typer.Option(None, "--end", help="End date YYYY-MM-DD (inclusive). Default: today minus BLEND_REFIT_LAG_DAYS."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Fit and report, but do not write blend meta files."),
+):
+    """
+    Re-fit the market-blend weight (global + per-disagreement-segment) from full-slate
+    scoring over a trailing window, so ``w`` tracks the model's actual recent
+    performance vs. the market instead of staying pinned wherever it was last set.
+
+    Uses full-slate snapshot scoring (like ``model-vs-market``), not fills — fills are
+    edge-selected and can't validate segments the strategy rarely trades. Meant to run
+    on a recurring schedule (see scripts/cron_job.sh `refit-blend` job); each run
+    overwrites models/blend_meta.json and models/blend_meta_segments.json with the
+    latest fit, so a model that starts beating the market pulls its own weight back up
+    over time, without requiring a manual re-fit or a hand-set floor.
+    """
+    from datetime import timedelta
+
+    from config import BLEND_REFIT_LAG_DAYS, BLEND_REFIT_LOOKBACK_DAYS, MIN_BLEND_ROWS, MIN_BLEND_ROWS_SEGMENT
+    from journal_reader import parse_iso_date
+    from market_blend import (
+        DISAGREEMENT_BUCKETS,
+        disagreement_bucket,
+        fit_blend_weight,
+        save_blend_meta,
+        save_segment_blend_meta,
+    )
+    from model_vs_market import evaluate_day
+
+    end_d = parse_iso_date(end) if end else (datetime.now() - timedelta(days=BLEND_REFIT_LAG_DAYS))
+    if start:
+        start_d = parse_iso_date(start)
+    else:
+        lookback = int(days) if days is not None else BLEND_REFIT_LOOKBACK_DAYS
+        start_d = end_d - timedelta(days=lookback)
+    if end_d < start_d:
+        _warn("--end must be >= --start")
+        raise typer.Exit(2)
+
+    range_start, range_end = start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
+    _header(f"Refit market-blend weight — {range_start} → {range_end}")
+    _warn(
+        "Saved model may have trained on these dates (look-ahead in the model's favor). "
+        "Prefer dates after the model's training cutoff."
+    )
+
+    rows = []
+    d = start_d
+    while d <= end_d:
+        ds = d.strftime("%Y-%m-%d")
+        day_rows = evaluate_day(ds)
+        rows.extend(day_rows)
+        d += timedelta(days=1)
+    if not rows:
+        _warn("No scoreable markets in the lookback window (need snapshots + ETL'd boxscores).")
+        raise typer.Exit(0)
+
+    t = Table(title="Refit — global + per-bucket", box=box.SIMPLE_HEAD)
+    t.add_column("Slice")
+    t.add_column("N", justify="right")
+    t.add_column("LL market", justify="right")
+    t.add_column("LL model", justify="right")
+    t.add_column("w fit", justify="right")
+    t.add_column("Status")
+
+    global_w, global_diag = None, None
+    if len(rows) >= MIN_BLEND_ROWS:
+        all_fit_rows = [{"p": r.p_model_cal, "m": r.p_market_mid, "y": r.y, "weight": 1.0} for r in rows]
+        global_w, global_diag = fit_blend_weight(all_fit_rows)
+        t.add_row(
+            "all (global)",
+            str(len(rows)),
+            f"{global_diag['logloss_market_only']:.4f}",
+            f"{global_diag['logloss_model_only']:.4f}",
+            f"{global_w:.2f}",
+            "[green]fit[/green]",
+        )
+    else:
+        t.add_row("all (global)", str(len(rows)), "-", "-", "-", f"[dim]skipped (<{MIN_BLEND_ROWS})[/dim]")
+
+    by_bucket: dict[str, list] = {b: [] for b in DISAGREEMENT_BUCKETS}
+    for r in rows:
+        by_bucket[disagreement_bucket(r.p_model_cal, r.p_market_mid)].append(r)
+
+    segments: dict[str, tuple[float, dict]] = {}
+    for bucket in DISAGREEMENT_BUCKETS:
+        bucket_rows = by_bucket[bucket]
+        n = len(bucket_rows)
+        if n < MIN_BLEND_ROWS_SEGMENT:
+            t.add_row(bucket, str(n), "-", "-", "-", f"[dim]skipped (<{MIN_BLEND_ROWS_SEGMENT})[/dim]")
+            continue
+        fit_rows = [{"p": r.p_model_cal, "m": r.p_market_mid, "y": r.y, "weight": 1.0} for r in bucket_rows]
+        w, diag = fit_blend_weight(fit_rows)
+        segments[bucket] = (w, diag)
+        t.add_row(
+            bucket,
+            str(n),
+            f"{diag['logloss_market_only']:.4f}",
+            f"{diag['logloss_model_only']:.4f}",
+            f"{w:.2f}",
+            "[green]fit[/green]",
+        )
+    console.print(t)
+
+    if dry_run:
+        _warn("Dry run — blend meta files not written.")
+        raise typer.Exit(0)
+    if global_w is None and not segments:
+        _warn("Nothing cleared its row minimum — no files written.")
+        raise typer.Exit(0)
+
+    if global_w is not None:
+        save_blend_meta(global_w, global_diag, start=range_start, end=range_end)
+    if segments:
+        save_segment_blend_meta(segments, start=range_start, end=range_end)
+
+    msg = f"global w={global_w:.2f}" if global_w is not None else "global skipped (too few rows)"
+    _success(f"Refit complete: {msg}, {len(segments)} segment(s) updated. scan applies both automatically.")
 
 
 def model_vs_market(

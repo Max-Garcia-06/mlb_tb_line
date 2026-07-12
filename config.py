@@ -28,11 +28,31 @@ USE_MARKET_BLEND = os.getenv("USE_MARKET_BLEND", "true").lower() in ("1", "true"
 _BLEND_W_RAW = os.getenv("BLEND_WEIGHT")
 BLEND_WEIGHT_OVERRIDE = float(_BLEND_W_RAW) if _BLEND_W_RAW not in (None, "") else None
 DEFAULT_BLEND_WEIGHT = float(os.getenv("DEFAULT_BLEND_WEIGHT", "0.35"))
-# Floor on the fitted weight: small resolved-fill samples can grid-search into a
-# noisy near-zero w, discarding the model entirely rather than truly showing no signal.
-MIN_BLEND_WEIGHT = float(os.getenv("MIN_BLEND_WEIGHT", "0.3"))
+# Floor on the fitted weight so a fit never fully zeroes the model out. Kept small:
+# full-slate scoring (model-vs-market, 04-27->07-06, N=5794) confirmed the low fitted
+# w is real signal, not small-sample noise (market beats model in every disagreement
+# bucket and most days), so the floor should not manufacture trust the data doesn't
+# support. A 0.3 floor did exactly that on 2026-07-10 and re-armed trading on edges
+# the model has never earned.
+MIN_BLEND_WEIGHT = float(os.getenv("MIN_BLEND_WEIGHT", "0.05"))
 MIN_BLEND_ROWS = int(os.getenv("MIN_BLEND_ROWS", "200"))
 BLEND_META_PATH = MODEL_DIR / "blend_meta.json"
+
+# Segment-level blend weights (by |model-market| disagreement bucket; see
+# market_blend.disagreement_bucket). Fit via `fit-blend-segments` on full-slate
+# snapshot scoring (not fills - fills are edge-selected, so low-disagreement
+# buckets would have near-zero fill coverage). Falls back to the global weight
+# above when a segment is missing or under MIN_BLEND_ROWS_SEGMENT.
+MIN_BLEND_ROWS_SEGMENT = int(os.getenv("MIN_BLEND_ROWS_SEGMENT", "100"))
+SEGMENT_BLEND_META_PATH = MODEL_DIR / "blend_meta_segments.json"
+
+# `refit-blend` trailing window: re-fits global + segment weights from full-slate
+# scoring on a recurring schedule (see scripts/cron_job.sh) so w tracks the model's
+# actual recent performance vs. the market instead of staying pinned wherever it was
+# last set by hand. LAG_DAYS skips the most recent days, whose boxscores/ETL may not
+# be finalized yet.
+BLEND_REFIT_LOOKBACK_DAYS = int(os.getenv("BLEND_REFIT_LOOKBACK_DAYS", "30"))
+BLEND_REFIT_LAG_DAYS = int(os.getenv("BLEND_REFIT_LAG_DAYS", "2"))
 
 # Kalshi trading fees: taker fee = ceil(rate * C * P * (1-P)) cents; resting (maker) orders free.
 KALSHI_TAKER_FEE_RATE = float(os.getenv("KALSHI_TAKER_FEE_RATE", "0.07"))
@@ -194,4 +214,10 @@ BACKTEST_FILL_MODEL = os.getenv("BACKTEST_FILL_MODEL", "true").lower() in ("1", 
 # Feature materialization (gold layer in SQLite)
 MATERIALIZE_FEATURES_ON_ETL = os.getenv("MATERIALIZE_FEATURES_ON_ETL", "true").lower() in ("1", "true", "yes")
 FEATURES_TABLE = os.getenv("FEATURES_TABLE", "batter_features")
+
+# Scan summary email (Gmail SMTP; app password, not the account password)
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+GMAIL_SENDER = os.getenv("GMAIL_SENDER", "")
+SCAN_EMAIL_RECIPIENT = os.getenv("SCAN_EMAIL_RECIPIENT", GMAIL_SENDER)
+SCAN_EMAIL_ENABLED = os.getenv("SCAN_EMAIL_ENABLED", "true").lower() in ("1", "true", "yes")
 

@@ -203,7 +203,7 @@ def quote_side_edge(
     bid, ask = float(bid), float(ask)
     # Empty book side ⇒ mid = ask/2 is noise; shrink toward the ask instead (conservative).
     mid = (bid + ask) / 2.0 if bid > 0 else ask
-    p_blend = blend_probability(float(p_side_cal), mid, load_blend_weight())
+    p_blend = blend_probability(float(p_side_cal), mid, load_blend_weight(float(p_side_cal), mid))
     limit = suggest_limit_price(side=side, bid=bid, ask=ask, model_fair=p_blend, maker=MAKER_MODE)
     is_taker = limit >= ask - 1e-9
     fee = fee_per_contract(limit, is_taker=is_taker)
